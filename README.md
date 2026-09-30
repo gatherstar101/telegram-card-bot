@@ -37,13 +37,24 @@ Worker → Settings → Variables and Secrets，添加并保存部署：
 
 ## 4. 注册 Webhook
 
+在 `scripts` 文件夹创建 `env` 文件（可复制 `env.example`），填写：
+
+```ini
+BOT_TOKEN=你的BotFather令牌
+WEBHOOK_SECRET=与Cloudflare中完全一致的密钥
+WORKER_URL=https://你的worker.你的子域.workers.dev
+WEBHOOK_PATH=/webhook
+```
+
+支持空行、整行 `#` 注释和包裹值的单引号/双引号；值按原文读取，不执行命令或展开变量。不要使用 `export` 或行尾注释。`scripts/env` 已被 Git 忽略，不提交密钥。建议执行 `chmod 600 scripts/env`。
+
 在 Bash 终端执行：
 
 ```bash
 bash scripts/register-webhook.sh
 ```
 
-依次输入 Token、与 Worker 完全一致的密钥、Worker HTTPS 地址和 Webhook 路径。确认 setWebhook 返回 `ok: true`，getWebhookInfo 的 URL 正确。
+脚本自动读取其所在目录的 `env`，不再交互输入。从 `scripts` 目录也可执行 `bash register-webhook.sh`。确认 setWebhook 返回 `ok: true`，getWebhookInfo 的 URL 正确。本地 env 只用于注册 Webhook，不会同步 Cloudflare 变量。
 
 ## 5. 测试
 
