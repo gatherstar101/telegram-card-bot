@@ -1,0 +1,7 @@
+BOT_TOKEN=replace_with_your_bot_token
+WEBHOOK_SECRET=replace_with_random_secret
+WEBHOOK_PATH=/webhook
+LANDING_URL=https://example.com/
+CARD_IMAGE=
+CARD_TEXT=欢迎访问平台，点击下方按钮进入。
+BUTTON_TEXT=立即进入平台

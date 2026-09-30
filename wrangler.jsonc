@@ -1,0 +1,7 @@
+{
+  "name": "telegram-card-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-30",
+  "workers_dev": true
+  // All business variables and secrets are configured in the Cloudflare dashboard.
+}
