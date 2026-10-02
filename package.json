@@ -7,6 +7,7 @@
     "start:api": "npm --prefix auto-register run start:api",
     "create:bot": "npm --prefix auto-register run create:bot",
     "dev": "npm --prefix card-bot run dev",
-    "deploy": "npm --prefix card-bot run deploy"
+    "deploy": "npm --prefix card-bot run deploy",
+    "test": "npm --prefix auto-register test"
   }
 }

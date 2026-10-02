@@ -7,6 +7,8 @@ import { TelegramClient, Api } from 'teleproto';
 import { StringSession } from 'teleproto/sessions/index.js';
 import { computeCheck } from 'teleproto/Password.js';
 import { createStore } from './store.js';
+import { Failure } from './errors.js';
+import { createConversion } from './conversion.js';
 
 process.umask(0o077);
 const key = process.env.API_KEY;
@@ -15,7 +17,6 @@ const directory = process.env.DATA_DIR || './data';
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const store = await createStore();
 const busy = new Set();
-class Failure extends Error { constructor(status, message) { super(message); this.status = status; } }
 function requireValue(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new Failure(400, `缺少 ${name}`);
   return value.trim();
@@ -50,6 +51,7 @@ async function exchange(client, peer, text) {
   }
   throw new Failure(504, 'BotFather 回复超时；请先检查对话，再重试创建');
 }
+const conversion = createConversion({ store, connected, save });
 async function route(method, path, body) {
   if (method === 'POST' && path === '/v1/login/start') {
     const phone = requireValue(body.phone ?? process.env.TG_PHONE, 'phone');
@@ -73,9 +75,10 @@ async function route(method, path, body) {
       return { account_id: id, status: state.status, delivery };
     } finally { busy.delete(phone); }
   }
-  const match = path.match(/^\/v1\/accounts\/([a-f0-9-]+)(?:\/(verify|bots)(?:\/([A-Za-z0-9_]+))?)?$/);
+  const match = path.match(/^\/v1\/accounts\/([a-f0-9-]+)(?:\/(.*))?$/);
   if (!match) throw new Failure(404, '接口不存在');
-  const [, id, action, username] = match;
+  const [, id, suffix = ''] = match;
+  const [action, username] = suffix.split('/');
   const initial = await load(id);
   if (busy.has(initial.phone)) throw new Failure(409, '该账号正在操作，请稍后重试');
   busy.add(initial.phone);
@@ -87,8 +90,16 @@ async function route(method, path, body) {
       delete state.pending_bot;
       await save(id, state);
     }
+    if (state.pending_channel) {
+      const pending = state.pending_channel;
+      await store.saveChannel(id, pending.request_key, pending);
+      delete state.pending_channel;
+      await save(id, state);
+    }
+    const converted = await conversion.route(method, suffix, id, state, body);
+    if (converted !== undefined) return converted;
     if (method === 'GET' && !action) return { account_id: id, status: state.status };
-    if (method === 'POST' && action === 'verify' && !username) {
+    if (method === 'POST' && suffix === 'verify') {
       if (state.status === 'authorized') return { account_id: id, status: state.status };
       if (Date.now() > state.expires_at) throw new Failure(410, '登录流程过期，请重新发送验证码');
       await connected(state, async client => {
@@ -116,12 +127,12 @@ async function route(method, path, body) {
       await save(id, state);
       return { account_id: id, status: state.status };
     }
-    if (action === 'bots' && method === 'GET' && username) {
+    if (action === 'bots' && method === 'GET' && username && suffix.split('/').length === 2) {
       const bot = await store.get(id, username);
       if (!bot) throw new Failure(404, '未找到本服务保存的 Bot');
       return bot;
     }
-    if (action === 'bots' && method === 'POST' && !username) {
+    if (method === 'POST' && suffix === 'bots') {
       if (state.status !== 'authorized') throw new Failure(401, '请先完成 Telegram 登录');
       const name = requireValue(body.name ?? process.env.TG_BOT_NAME, 'name');
       const user = requireValue(body.username ?? process.env.TG_BOT_USERNAME, 'username');
@@ -161,7 +172,9 @@ const server = http.createServer(async (req, res) => {
   const respond = (status, value) => { res.writeHead(status); res.end(JSON.stringify(value)); };
   try {
     if (req.method === 'GET' && req.url === '/health') return respond(200, { ok: true });
-    if (!authorized(req.headers.authorization)) throw new Failure(401, '需要有效 Bearer API_KEY');
+    const webhook = new URL(req.url, 'http://localhost').pathname.match(/^\/webhooks\/(\d+)$/);
+    if (!webhook && !authorized(req.headers.authorization)) throw new Failure(401, '需要有效 Bearer API_KEY');
+    if (webhook && req.method !== 'POST') throw new Failure(405, 'Webhook 仅支持 POST');
     let content = '';
     for await (const chunk of req) {
       content += chunk.toString();
@@ -170,6 +183,7 @@ const server = http.createServer(async (req, res) => {
     let body = {};
     try { if (content) body = JSON.parse(content); } catch { throw new Failure(400, 'JSON 格式错误'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Failure(400, '请求体必须为 JSON 对象');
+    if (webhook) return respond(200, await conversion.handleWebhook(webhook[1], req.headers['x-telegram-bot-api-secret-token'], body));
     respond(200, await route(req.method, new URL(req.url, 'http://localhost').pathname, body));
   } catch (e) {
     const status = e.status || (e.errorMessage?.startsWith('FLOOD_WAIT') ? 429 : e.errorMessage ? 422 : 500);

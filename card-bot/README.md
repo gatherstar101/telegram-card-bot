@@ -11,3 +11,5 @@ bash scripts/register-webhook.sh
 ```
 
 打开机器人发送 `/start` 验证。完整的配置明细、本地开发和故障处理见 [项目 README](../README.md#2-telegram-card-bot)。
+
+如果同一个 Bot 已注册到 Docker API 的客户卡片服务，应选择一个接收入口；注册本 Worker 会替换原 Webhook。单独使用本目录时，只需 Bot Token 和卡片配置，不需要个人 Telegram 会话或 MySQL。

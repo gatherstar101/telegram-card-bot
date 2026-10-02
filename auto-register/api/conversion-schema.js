@@ -1,27 +1,5 @@
--- MySQL 8.0+; repeatable and does not delete existing data.
--- Default database matches .env.example. For a custom MYSQL_DATABASE,
--- replace telegram_bot in CREATE DATABASE and USE before importing.
-CREATE DATABASE IF NOT EXISTS telegram_bot
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-USE telegram_bot;
-
-CREATE TABLE IF NOT EXISTS telegram_bots (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  account_id CHAR(36) NOT NULL,
-  telegram_bot_id BIGINT UNSIGNED NOT NULL,
-  username VARCHAR(32) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
-  name VARCHAR(64) NOT NULL,
-  token VARCHAR(256) NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_username (username),
-  UNIQUE KEY uq_telegram_bot_id (telegram_bot_id),
-  KEY ix_account (account_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Per-customer bot landing configuration and channel conversion records.
-CREATE TABLE IF NOT EXISTS bot_landings (
+export const conversionTables = [
+  `CREATE TABLE IF NOT EXISTS bot_landings (
     bot_username VARCHAR(32) CHARACTER SET ascii COLLATE ascii_general_ci PRIMARY KEY,
     account_id CHAR(36) NOT NULL,
     customer_id VARCHAR(64) NOT NULL,
@@ -33,9 +11,8 @@ CREATE TABLE IF NOT EXISTS bot_landings (
     webhook_url TEXT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY ix_customer (customer_id)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS telegram_channels (
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS telegram_channels (
     account_id CHAR(36) NOT NULL,
     request_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     customer_id VARCHAR(64) NOT NULL,
@@ -48,9 +25,8 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
     status VARCHAR(32) NOT NULL DEFAULT 'creating',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, request_key)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS channel_posts (
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS channel_posts (
     account_id CHAR(36) NOT NULL,
     channel_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     request_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -62,4 +38,5 @@ CREATE TABLE IF NOT EXISTS channel_posts (
     message_id BIGINT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, channel_key, request_key)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+];

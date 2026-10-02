@@ -10,6 +10,7 @@ services:
     environment:
       API_KEY: ${API_KEY:?Set API_KEY in .env}
       DATA_DIR: /data
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       TG_API_ID: ${TG_API_ID:-}
       TG_API_HASH: ${TG_API_HASH:-}
       TG_PHONE: ${TG_PHONE:-}

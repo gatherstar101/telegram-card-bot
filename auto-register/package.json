@@ -3,14 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js",
+    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/conversion-schema.js && node --check api/errors.js",
     "create:bot": "node scripts/create-bot.js",
-    "start:api": "node api/server.js"
+    "start:api": "node api/server.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "big-integer": "^1.6.52",
     "mysql2": "^3.24.5",
     "teleproto": "^1.229.1"
   }
