@@ -6,3 +6,13 @@ node_modules/
 .env
 .env.*
 scripts/env
+scripts/create-bot.env
+scripts/.bot-token.env
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+.venv/
+__pycache__/
+!.env.example
+data/

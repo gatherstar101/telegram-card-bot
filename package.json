@@ -3,8 +3,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/index.js",
+    "check": "node --check src/index.js && node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js",
     "dev": "npx wrangler dev",
-    "deploy": "npx wrangler deploy"
+    "deploy": "npx wrangler deploy",
+    "create:bot": "node scripts/create-bot.js",
+    "start:api": "node api/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mysql2": "^3.24.5",
+    "teleproto": "^1.229.1"
   }
 }
