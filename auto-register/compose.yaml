@@ -1,3 +1,4 @@
+name: telegram-card-bot-github
 services:
   telegram-api:
     build: .

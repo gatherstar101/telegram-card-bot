@@ -5,6 +5,25 @@
 - [Bot 自动化创建](#1-bot-自动化创建)：环境配置、容器部署、登录、创建和持久化。
 - [Telegram Card Bot](#2-telegram-card-bot)：卡片配置、Worker 部署和 Webhook 注册。
 
+## 项目目录
+
+```text
+auto-register/             Bot 注册 API 和独立创建脚本
+  api/                     登录、BotFather 创建、MySQL 存储
+  scripts/                 命令行创建脚本和配置模板
+  sql/init.sql             可选手工建库建表 SQL
+  Dockerfile               Node.js API 镜像
+  compose.yaml             API 部署与会话卷
+  .env.example             API、MySQL、Telegram 默认配置
+card-bot/                  Telegram 卡片服务
+  src/index.js             Cloudflare Worker
+  scripts/                 Webhook 注册脚本和配置模板
+  wrangler.jsonc           Worker 部署配置
+  .dev.vars.example        Worker 本地变量模板
+```
+
+两个目录各自包含 `package.json`，可独立安装和运行。仓库根目录的 npm 命令仅转发到对应服务；`npm run check` 同时检查两个服务。已有本地 `.env` 已迁入 `auto-register/.env`，不提交到 Git。
+
 ## 1. Bot 自动化创建
 
 Node.js API 服务与 Worker 卡片服务独立运行。创建参数通过 JSON 请求传入，也可在 `.env` 设置默认值；请求值优先。首次验证码验证后，登录会话保存到 `/data` 数据卷，Bot 信息和 Token 存入 MySQL，容器重启后可继续使用。单实例运行，同一手机号的操作禁止并发。
@@ -19,6 +38,12 @@ Node.js API 服务与 Worker 卡片服务独立运行。创建参数通过 JSON 
 - 首次需完成验证码及可能的两步验证密码校验，网页端登录不会自动授权本服务。
 
 ### Docker 部署
+
+以下 API 命令均在 `auto-register/` 目录执行：
+
+```bash
+cd auto-register
+```
 
 ```bash
 cp .env.example .env
@@ -59,7 +84,7 @@ docker run -d --name telegram-card-bot-api --restart unless-stopped \
   telegram-card-bot-api:local
 ```
 
-单独使用 `docker run` 时端口由 `-p` 参数指定；`API_PORT` 只供 Compose 插值。两种部署方式使用不同的卷名，选择一种并在后续部署中保留同一个卷。
+单独使用 `docker run` 时端口由 `-p` 参数指定；`API_PORT` 只供 Compose 插值。两种部署方式使用不同的卷名，选择一种并在后续部署中保留同一个卷。Compose 固定项目名为 `telegram-card-bot-github`，目录重组后继续使用原容器和 `telegram-card-bot-github_telegram-data` 卷；若改项目名，也需显式复用原卷才能读取旧会话。
 
 ### API 使用约定和接口明细
 
@@ -198,7 +223,7 @@ Compose 仅启动 API 服务，使用已有 MySQL，不会创建新的数据库�
 
 ### 可选：手动初始化数据库和表
 
-通常无需手动导入，服务启动已自动完成建库建表。如需管理员预先初始化，建库建表脚本为 [`sql/init.sql`](sql/init.sql)，默认数据库名为 `telegram_bot`，与 `.env.example` 一致。若使用其他 `MYSQL_DATABASE`，先修改 SQL 中的 `CREATE DATABASE` 和 `USE` 数据库名。脚本使用 `IF NOT EXISTS`，可重复导入，不会清空现有数据；不会自动修改已存在表的结构。
+通常无需手动导入，服务启动已自动完成建库建表。如需管理员预先初始化，建库建表脚本为 [`sql/init.sql`](auto-register/sql/init.sql)，默认数据库名为 `telegram_bot`，与 `.env.example` 一致。若使用其他 `MYSQL_DATABASE`，先修改 SQL 中的 `CREATE DATABASE` 和 `USE` 数据库名。脚本使用 `IF NOT EXISTS`，可重复导入，不会清空现有数据；不会自动修改已存在表的结构。
 
 使用宿主机 MySQL 客户端导入（密码在提示中输入）：
 
@@ -221,7 +246,7 @@ docker exec -it mysql mysql -u root -p -e 'source /tmp/telegram-bot-init.sql'
 
 `scripts/create-bot.js` 使用个人 Telegram 账号通过 MTProto 与官方 BotFather 对话，依次发送 `/newbot`、名称和用户名，提取返回的 Bot Token。首次无需已有 Bot Token，但需要在 [my.telegram.org](https://my.telegram.org) → API development tools 申请的 App `api_id`、`api_hash`。网页端登录会话不能直接作为本脚本的会话。
 
-在仓库根目录执行：
+在 `auto-register/` 目录执行：
 
 ```bash
 npm install
@@ -267,6 +292,12 @@ Cloudflare Workers 接收 Telegram Webhook，在私聊收到 `/start` 后发送�
 
 ### 准备
 
+以下卡片服务命令均在 `card-bot/` 目录执行：
+
+```bash
+cd card-bot
+```
+
 - 使用上方 API 创建 Bot 获取 Token，或在官方 @BotFather 通过 `/newbot` 手动创建。
 - 注册 Cloudflare 账号，准备卡片图片直链和文案。
 - Token 通常是 `数字ID:密钥`，Bot 用户名和普通账号 ID 不是 Token。
@@ -287,10 +318,10 @@ Cloudflare Workers 接收 Telegram Webhook，在私聊收到 `/start` 后发送�
 Cloudflare 控制台 → Workers & Pages → 创建应用 → 从 Git 仓库导入，选择本仓库。
 
 - 部署命令：`npx wrangler deploy`
-- 项目根目录：仓库根目录。
+- 项目根目录：`card-bot`。
 - 本项目无需构建；如果要求构建命令，可填写 `npm run check`。
 
-也可以创建 Hello World Worker，在代码编辑器粘贴 `src/index.js` 并部署。使用提供的 `workers.dev` 地址，无需自有域名。
+也可以创建 Hello World Worker，在代码编辑器粘贴 `card-bot/src/index.js` 并部署。使用提供的 `workers.dev` 地址，无需自有域名。
 
 ### 配置运行时变量
 
