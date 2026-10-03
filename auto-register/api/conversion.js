@@ -50,7 +50,7 @@ function publicLanding(config) {
   return result;
 }
 function publicChannel(channel) {
-  const { access_hash, ...result } = channel;
+  const { access_hash, posts, ...result } = channel;
   return { ...result, bot_url: `https://t.me/${channel.bot_username}?start=channel` };
 }
 export function createConversion({ store, connected, save, env = process.env, fetcher = fetch }) {

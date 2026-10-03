@@ -1,6 +1,6 @@
 # 客户 Bot、Landing Page 和 Channel 转化流程
 
-在同一个已登录 Telegram 账号下，可以为不同客户创建各自的 Bot、绑定不同落地页，并创建频道和发布引导内容。`customer_id` 是客户业务标识，不是登录用户权限；目前仍使用管理员 API_KEY。这里配置的是客户已有的 Landing Page URL，不自动生成或部署落地页。
+在同一个已登录 Telegram 账号下，可以为不同客户创建各自的 Bot、绑定不同落地页，并创建频道和发布引导内容。`customer_id` 是客户业务标识；访问由平台注册用户和 Telegram account_id 的归属控制。这里配置的是客户已有的 Landing Page URL，不自动生成或部署落地页。
 
 流程拆分为独立 API，便于分别调用和恢复：
 
@@ -17,21 +17,21 @@ Channel → Bot 链接 → 用户按 Start → 客户卡片 → Landing Page
 
 ## 部署和配置
 
-在 `auto-register/` 目录配置 `.env`，沿用 README 的 API_KEY、MySQL 和 Telegram 参数，增加：
+在 `auto-register/` 目录配置 `.env`，沿用 README 的 鉴权、MySQL、Redis、SMTP 和 Telegram 参数，增加：
 
 ```ini
 PUBLIC_BASE_URL=https://bots.example.com
 ```
 
-此值必须是指向 API 容器的公网 HTTPS 源地址，不含路径、查询参数或认证信息。使用反向代理将此域名转发到本地 API 端口，允许 Telegram 访问 `/webhooks/*`。这些 Webhook 请求通过 `X-Telegram-Bot-Api-Secret-Token` 校验，不使用管理员 API_KEY。其他业务接口继续使用 Bearer API_KEY。
+此值必须是指向 API 容器的公网 HTTPS 源地址，不含路径、查询参数或认证信息。使用反向代理将此域名转发到本地 API 端口，允许 Telegram 访问 `/webhooks/*`。这些 Webhook 请求通过 `X-Telegram-Bot-Api-Secret-Token` 校验，不使用平台登录令牌。其他业务接口使用 Bearer access_token。
 
 ```bash
 docker compose up -d --build
 ```
 
-启动会自动补建 `bot_landings`、`telegram_channels`、`channel_posts`，保留已有 Bot 表和数据。可选手工 SQL 同样包含这些表。PUBLIC_BASE_URL 只用于注册 Webhook；已经注册的 URL 需重新调用注册接口才能改变。
+启动会自动创建 `user_info`、`tg_info`、`bot_info`、`channel_info`；客户卡片保存在 bot_info，帖子保存在 channel_info 的 posts JSON。旧表保留，需确认归属后迁移。可选手工 SQL 同样包含这些表。PUBLIC_BASE_URL 只用于注册 Webhook；已经注册的 URL 需重新调用注册接口才能改变。
 
-以下示例的 YOUR_API_KEY、ACCOUNT_ID、Bot 用户名和 URL 使用自己的实际值。第一次先按项目 README 完成登录，之后复用返回的 ACCOUNT_ID。
+以下示例的 YOUR_ACCESS_TOKEN、ACCOUNT_ID、Bot 用户名和 URL 使用自己的实际值。第一次先按 [AUTH.md](AUTH.md) 完成平台邮箱注册/登录，取得 access_token，再按项目 README 完成 Telegram 登录，之后复用返回的 ACCOUNT_ID。
 
 ## 0. 登录并保存 account_id
 
@@ -43,7 +43,7 @@ docker compose up -d --build
 
 ```bash
 curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' -H 'Content-Type: application/json' \
   -d '{"name":"客户 A 助手","username":"customer_a_unique_bot"}'
 ```
 
@@ -53,7 +53,7 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots \
 
 ```bash
 curl -X PUT http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique_bot/landing \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' -H 'Content-Type: application/json' \
   -d '{
     "customer_id":"customer_a",
     "landing_url":"https://customer-a.example.com/offer?source=telegram",
@@ -77,7 +77,7 @@ PUT 保存完整配置，省略可选字段将恢复默认值。返回配置不�
 
 ```bash
 curl -X POST http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique_bot/webhook \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' -d '{}'
+  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' -H 'Content-Type: application/json' -d '{}'
 ```
 
 返回：
@@ -92,7 +92,7 @@ curl -X POST http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique
 
 ```bash
 curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/channels \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' -H 'Content-Type: application/json' \
   -d '{
     "request_key":"customer_a_channel_001",
     "bot_username":"customer_a_unique_bot",
@@ -118,7 +118,7 @@ Channel 创建请求本身没有服务端幂等键。如果发生网络错误，
 
 ```bash
 curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/channels/customer_a_channel_001/posts \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' -H 'Content-Type: application/json' \
   -d '{"request_key":"offer_post_001","text":"本周活动已上线，点击下方链接了解详情。"}'
 ```
 

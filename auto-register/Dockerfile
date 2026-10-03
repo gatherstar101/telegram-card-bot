@@ -3,6 +3,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY api ./api
+COPY scripts/assign-account.js ./scripts/assign-account.js
 RUN mkdir /data && chown node:node /data
 USER node
 ENV PORT=3000 DATA_DIR=/data

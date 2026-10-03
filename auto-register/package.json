@@ -3,10 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/conversion-schema.js && node --check api/errors.js",
+    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/errors.js && node --check api/auth.js && node --check api/auth-runtime.js && node --check scripts/assign-account.js && node --check api/schema.js",
     "create:bot": "node scripts/create-bot.js",
     "start:api": "node api/server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "assign:account": "node scripts/assign-account.js"
   },
   "engines": {
     "node": ">=20"
@@ -14,6 +15,8 @@
   "dependencies": {
     "big-integer": "^1.6.52",
     "mysql2": "^3.24.5",
+    "nodemailer": "^10.0.13",
+    "redis": "^6.3.0",
     "teleproto": "^1.229.1"
   }
 }

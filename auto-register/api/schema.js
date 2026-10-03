@@ -1,16 +1,12 @@
--- MySQL 8.0+; use the same database name as MYSQL_DATABASE.
-CREATE DATABASE IF NOT EXISTS telegram_bot CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE telegram_bot;
-
-CREATE TABLE IF NOT EXISTS user_info (
+export const tables = [
+  `CREATE TABLE IF NOT EXISTS user_info (
     id CHAR(36) NOT NULL PRIMARY KEY,
     email VARCHAR(254) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
     password_hash VARCHAR(256) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_user_email (email)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS tg_info (
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS tg_info (
     account_id CHAR(36) NOT NULL PRIMARY KEY,
     user_id CHAR(36) NOT NULL,
     api_id BIGINT UNSIGNED NOT NULL,
@@ -25,9 +21,8 @@ CREATE TABLE IF NOT EXISTS tg_info (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY ix_tg_user (user_id)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS bot_info (
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS bot_info (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     user_id CHAR(36) NOT NULL,
     account_id CHAR(36) NOT NULL,
@@ -49,9 +44,8 @@ CREATE TABLE IF NOT EXISTS bot_info (
     KEY ix_bot_user (user_id),
     KEY ix_bot_account (account_id),
     KEY ix_bot_customer (customer_id)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS channel_info (
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS channel_info (
     account_id CHAR(36) NOT NULL,
     user_id CHAR(36) NOT NULL,
     request_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -67,4 +61,5 @@ CREATE TABLE IF NOT EXISTS channel_info (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, request_key),
     KEY ix_channel_user (user_id)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+];

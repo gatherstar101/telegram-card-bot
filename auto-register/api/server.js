@@ -1,7 +1,5 @@
 import http from 'node:http';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
-import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { TelegramClient, Api } from 'teleproto';
 import { StringSession } from 'teleproto/sessions/index.js';
@@ -9,32 +7,23 @@ import { computeCheck } from 'teleproto/Password.js';
 import { createStore } from './store.js';
 import { Failure } from './errors.js';
 import { createConversion } from './conversion.js';
+import { createAuthRuntime } from './auth-runtime.js';
 
 process.umask(0o077);
-const key = process.env.API_KEY;
-if (!key || key.length < 32) throw new Error('API_KEY 必须至少 32 字符');
-const directory = process.env.DATA_DIR || './data';
-await mkdir(directory, { recursive: true, mode: 0o700 });
 const store = await createStore();
+const auth = await createAuthRuntime(store);
 const busy = new Set();
 function requireValue(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new Failure(400, `缺少 ${name}`);
   return value.trim();
 }
-function statePath(id) {
-  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Failure(400, '无效 account_id');
-  return join(directory, `${id}.json`);
-}
 async function load(id) {
-  try { return JSON.parse(await readFile(statePath(id), 'utf8')); }
-  catch (e) { if (e.code === 'ENOENT') throw new Failure(404, '账号不存在'); throw e; }
+  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Failure(400, '无效 account_id');
+  const state = await store.getAccount(id);
+  if (!state) throw new Failure(404, '账号不存在');
+  return state;
 }
-async function save(id, state) {
-  const path = statePath(id);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
-  await rename(temporary, path);
-}
+async function save(id, state) { await store.saveAccount(id, state); }
 async function connected(state, operation) {
   const client = new TelegramClient(new StringSession(state.session || ''), state.api_id, state.api_hash, { connectionRetries: 3 });
   try { await client.connect(); return await operation(client); }
@@ -52,7 +41,8 @@ async function exchange(client, peer, text) {
   throw new Failure(504, 'BotFather 回复超时；请先检查对话，再重试创建');
 }
 const conversion = createConversion({ store, connected, save });
-async function route(method, path, body) {
+async function route(method, path, body, user) {
+  if (method === 'GET' && path === '/v1/accounts') return { accounts: await store.accountsForUser(user.id) };
   if (method === 'POST' && path === '/v1/login/start') {
     const phone = requireValue(body.phone ?? process.env.TG_PHONE, 'phone');
     const api_id = Number(body.api_id ?? process.env.TG_API_ID);
@@ -61,9 +51,11 @@ async function route(method, path, body) {
     // Serialize by phone even when callers start separate login attempts.
     if (busy.has(phone)) throw new Failure(409, '该手机号正在操作');
     busy.add(phone);
+    let release;
     try {
+      release = await auth.lockPhone(phone);
       const id = randomUUID();
-      const state = { api_id, api_hash, phone, status: 'code_required' };
+      const state = { user_id: user.id, api_id, api_hash, phone, status: 'code_required' };
       const delivery = await connected(state, async client => {
         const result = await client.sendCode({ apiId: api_id, apiHash: api_hash }, phone);
         if (result.emailRequired || result.emailCodeSent) throw new Failure(422, '此账号需要额外邮箱验证，当前接口不支持');
@@ -73,16 +65,20 @@ async function route(method, path, body) {
       state.expires_at = Date.now() + 10 * 60 * 1000;
       await save(id, state);
       return { account_id: id, status: state.status, delivery };
-    } finally { busy.delete(phone); }
+    } finally { busy.delete(phone); await release?.(); }
   }
   const match = path.match(/^\/v1\/accounts\/([a-f0-9-]+)(?:\/(.*))?$/);
   if (!match) throw new Failure(404, '接口不存在');
   const [, id, suffix = ''] = match;
   const [action, username] = suffix.split('/');
+  await auth.requireAccount(user.id, id);
   const initial = await load(id);
+  if (initial.user_id !== user.id) throw new Failure(404, '账号不存在');
   if (busy.has(initial.phone)) throw new Failure(409, '该账号正在操作，请稍后重试');
   busy.add(initial.phone);
+  let release;
   try {
+    release = await auth.lockPhone(initial.phone);
     const state = await load(id);
     if (state.pending_bot) {
       const recovered = await store.get(id, state.pending_bot.username);
@@ -150,7 +146,7 @@ async function route(method, path, body) {
         const token = reply.match(/\b\d+:[A-Za-z0-9_-]{30,}\b/)?.[0];
         if (!token) throw new Failure(422, 'BotFather 未返回 Token，请检查用户名占用或创建限制');
         bot = { username: user, name, token, url: `https://t.me/${user}` };
-        // Recovery journal covers a database outage after remote bot creation.
+        // Persist the remote result before inserting the bot record.
         state.pending_bot = bot;
         await save(id, state);
         await store.save(id, bot);
@@ -160,11 +156,7 @@ async function route(method, path, body) {
       return bot;
     }
     throw new Failure(404, '接口不存在');
-  } finally { busy.delete(initial.phone); }
-}
-function authorized(header) {
-  const a = Buffer.from(header || ''); const b = Buffer.from(`Bearer ${key}`);
-  return a.length === b.length && timingSafeEqual(a,b);
+  } finally { busy.delete(initial.phone); await release?.(); }
 }
 const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -173,7 +165,9 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') return respond(200, { ok: true });
     const webhook = new URL(req.url, 'http://localhost').pathname.match(/^\/webhooks\/(\d+)$/);
-    if (!webhook && !authorized(req.headers.authorization)) throw new Failure(401, '需要有效 Bearer API_KEY');
+    const path = new URL(req.url, 'http://localhost').pathname;
+    const authRoute = path.startsWith('/auth/');
+    const identity = !webhook && !authRoute ? await auth.authenticate(req.headers.authorization) : null;
     if (webhook && req.method !== 'POST') throw new Failure(405, 'Webhook 仅支持 POST');
     let content = '';
     for await (const chunk of req) {
@@ -184,7 +178,8 @@ const server = http.createServer(async (req, res) => {
     try { if (content) body = JSON.parse(content); } catch { throw new Failure(400, 'JSON 格式错误'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Failure(400, '请求体必须为 JSON 对象');
     if (webhook) return respond(200, await conversion.handleWebhook(webhook[1], req.headers['x-telegram-bot-api-secret-token'], body));
-    respond(200, await route(req.method, new URL(req.url, 'http://localhost').pathname, body));
+    if (authRoute) return respond(200, await auth.route(req.method, path, body, req.headers.authorization, req.socket.remoteAddress || 'unknown'));
+    respond(200, await route(req.method, path, body, identity.user));
   } catch (e) {
     const status = e.status || (e.errorMessage?.startsWith('FLOOD_WAIT') ? 429 : e.errorMessage ? 422 : 500);
     respond(status, { error: e.status ? e.message : e.errorMessage || '服务内部错误' });
