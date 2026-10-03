@@ -1,100 +1,133 @@
-# Bot 自动化创建与 Telegram Card Bot
+# Telegram Bot 自动化平台
 
-本项目提供两种卡片接入方式。`auto-register` 是 Node.js Docker API，负责个人 Telegram 账号登录、Bot 自动创建、客户落地页配置、Webhook、Channel 创建和引导帖子发布，用户、Telegram 会话、Bot 和 Channel 存入 MySQL，邮箱验证码与平台登录态存入 Redis。`card-bot` 是独立 Cloudflare Worker，使用已有 Bot Token 返回固定卡片，可单独部署。
+主服务 `auto-register` 提供 Node.js Docker API：用户完成邮箱鉴权后登录个人 Telegram 账号，创建自己的 Bot、配置客户 Landing Page 卡片、注册 Webhook，并按需创建 Channel 和发布引导帖子。用户和业务数据持久化至 MySQL，邮件验证码与平台登录态由 Redis 管理。
 
-- [Bot 自动化创建和客户转化流程](#1-bot-自动化创建和客户转化流程)
-- [API 接口文档](#api-reference)
-- [Docker 构建、更新和验证](#build-and-verify)
-- [Telegram Card Bot](#2-telegram-card-bot)
+**整套主服务只构建 `auto-register/` 一个目录。** 已有的 `card-bot/` 作为 Legacy Cloudflare Worker 保留，其卡片回复能力也已集成到主服务。新部署按本文的 Docker 流程操作；Legacy 使用说明放在文末。
 
-## 项目目录
+- [设计与配置原则](#design)
+- [架构、身份与数据模型](#architecture)
+- [环境变量与配置需求](#configuration)
+- [Docker 构建、部署和更新](#build-and-verify)
+- [API 清单与完整调用示例](#api-reference)
+- [错误处理、持久化和迁移](#operations)
+- [测试与当前验证范围](#verification)
+- [Legacy：card-bot](#legacy-card-bot)
 
-```text
-auto-register/             Bot、客户落地页和 Channel API
-  api/                     登录、资源创建、客户卡片、MySQL 存储
-  AUTH.md                  邮箱鉴权、Redis TTL、用户归属与旧会话迁移
-  CONVERSION.md            客户转化接口与恢复说明
-  test/                    模拟 Telegram 流程测试
-  scripts/                 命令行创建脚本和配置模板
-  sql/init.sql             可选手工建库建表 SQL
-  Dockerfile               Node.js API 镜像
-  compose.yaml             API 部署与旧会话迁移卷
-  .env.example             API、MySQL、Redis、SMTP、Telegram 配置
-card-bot/                  Telegram 卡片服务
-  src/index.js             Cloudflare Worker
-  scripts/                 Webhook 注册脚本和配置模板
-  wrangler.jsonc           Worker 部署配置
-  .dev.vars.example        Worker 本地变量模板
-```
+<a id="design"></a>
 
-两个目录各自包含 `package.json`，可独立安装和运行。仓库根目录的 npm 命令仅转发到对应服务；`npm run check` 同时检查两个服务。已有本地 `.env` 已迁入 `auto-register/.env`，不提交到 Git。
+## 1. 设计与配置原则
 
-## 1. Bot 自动化创建和客户转化流程
+平台用户与 Telegram 个人账号分别认证。先用邮箱、密码和邮件验证码取得本服务的 access_token，再用 Telegram App api_id/api_hash、手机号和 Telegram 验证码建立 MTProto 会话。首次 Telegram 登录可能需要两步验证密码，App configuration 或网页端登录不能代替该认证步骤。
 
-用户先用邮箱、密码和一次性邮件验证码注册平台账号，再登录自己的 Telegram 个人账号并创建 Bot、频道和客户落地页配置。业务 API 使用每个用户独立的 Bearer 登录令牌，所有账号路径都检查归属；`customer_id` 仅用于业务关联。完整鉴权配置、注册和登录示例见 [AUTH.md](auto-register/AUTH.md)。
+Telegram App 凭据从 [my.telegram.org](https://my.telegram.org) 的 API development tools 获取。验证码由 Telegram 决定发送渠道，可能发到已有 Telegram 客户端；当前服务不保证短信，也不自动读取验证码。
 
-服务采用独立 API 分步执行，没有一次请求完成全部创建的接口。各步的调用顺序和输出如下：
+服务配置通过环境变量传入，用户自己的账号凭据及业务内容通过 API 请求传入。请求中的 Telegram App 凭据、手机号、Bot 名称和用户名优先于对应 TG_* 环境变量。多用户使用时，应在请求中传每个用户自己的配置；全局 TG_* 默认值适合单账号部署。
 
-| 步骤 | 操作 | 前置条件 | 返回或保存 |
-| --- | --- | --- | --- |
-| 部署 | Docker 启动，自动建库建表 | 可连接 MySQL、Redis，配置鉴权密钥和 SMTP | API 服务、MySQL 四张业务表 |
-| 0 | 邮箱注册/登录并提交邮件验证码 | 邮箱、密码、邮件验证码 | access_token，默认 2 小时有效 |
-| 1 | 发起 Telegram 登录 | App 凭据和个人手机号 | account_id、验证码接收方式 |
-| 2 | 提交验证码及可能的两步验证密码 | 本次登录的 account_id | authorized、持久化会话 |
-| 3 | 创建指定 Bot | 有效用户会话、唯一 Bot 用户名 | Bot Token、Bot URL |
-| 4 | 配置客户落地页和卡片 | 本服务保存的 Bot | customer_id、卡片配置 |
-| 5 | 注册 Webhook | 已保存卡片配置、公网 HTTPS API 地址 | 每个 Bot 的 Webhook URL |
-| 6 | 创建私有 Channel，可选 | 有效用户会话、已配置落地页的 Bot | Channel ID、邀请链接 |
-| 7 | 发布引导帖子，可选 | ready 状态的 Channel | Bot 链接、落地页链接、帖子结果 |
+持久数据与短期认证状态分别管理。MySQL 保存用户、Telegram session、Bot Token、客户卡片和频道；Redis 保存邮件验证码、平台登录令牌、限流计数和操作锁。平台令牌默认 2 小时有效，访问不续期；Telegram session 可在平台令牌过期后继续保留。
 
-已有有效会话时从步骤 3 继续；已有 Bot 时从步骤 4 继续；只做 Bot 卡片时完成步骤 5 即可。Channel 创建不依赖 Webhook 注册，但 Bot 的卡片回复必须在 Webhook 配置完成后才能工作。
+业务流程通过多个接口分步执行。先完成登录、创建 Bot 和卡片配置，再按需注册 Webhook、创建频道和发布帖子。Bot 创建通过已登录的个人账号与 BotFather 对话完成；接口依赖其英文提示、用户名可用性及账号限制。
+
+Landing Page 使用客户已有的完整 URL，本服务负责卡片按钮和频道引导链接。当前不会生成或托管落地页，不提供点击、注册或成交归因；频道成员需主动打开 Bot 并按 Start 才能收到卡片。
+
+| 阶段 | 输入 | 输出或保存结果 |
+| --- | --- | --- |
+| 平台注册/登录 | 邮箱、密码、邮件验证码 | user_id、默认 2 小时的 access_token |
+| Telegram 登录 | App 凭据、手机号、验证码，必要时两步验证密码 | account_id、持久化 MTProto session |
+| 创建 Bot | account_id、name、username | Bot 信息、Token 和 t.me 链接 |
+| 配置客户卡片 | Bot、customer_id、landing_url 和可选卡片字段 | bot_info 中的客户配置 |
+| 注册 Webhook | 已配置的 Bot、公网 HTTPS API 地址 | Bot 的专属回调 URL |
+| 创建 Channel（可选） | Bot、request_key、标题和简介 | 频道信息及邀请链接 |
+| 发布帖子（可选） | Channel、request_key、正文 | 帖子结果、Bot Start 链接和落地页链接 |
+
+已有 Telegram 会话时，在平台登录后复用原 account_id；已有 Bot 时可从配置卡片继续。频道流程不依赖 Webhook 已注册，但 Bot 自动回复需要有效 Webhook。
+
+<a id="architecture"></a>
+
+## 2. 架构、身份与数据模型
 
 ```mermaid
 flowchart LR
-    U[邮箱密码和邮件验证码] --> A[登录个人 Telegram 账号] --> B[创建 Bot]
-    B --> C[绑定客户和 Landing Page]
-    C --> D[注册 Bot Webhook]
-    C --> E[创建 Channel]
-    E --> F[发布引导帖子]
-    F --> G[用户点击 Bot 链接并按 Start]
-    D --> H[返回客户卡片]
-    G --> H
-    H --> I[客户 Landing Page]
-    F --> I
+    Client[调用方] -->|平台注册和登录| Auth[Node.js 鉴权模块]
+    Client -->|Bearer access_token| API[Node.js 业务 API]
+    Auth --> Redis[(Redis 验证码和登录态)]
+    Auth --> SMTP[SMTP 邮件服务]
+    Auth --> MySQL[(MySQL 四张业务表)]
+    API -->|校验登录态与账号归属| Redis
+    API --> MySQL
+    API -->|个人账号 MTProto| Telegram[Telegram 登录与 Channel]
+    API -->|个人账号对话| Father[BotFather 创建 Bot]
+    API -->|Bot Token| BotAPI[Telegram Bot API]
+    BotAPI -->|Secret 校验的 Webhook| API
+    API -->|私聊 Start 后发送卡片| EndUser[Telegram 用户]
+    EndUser -->|卡片按钮或频道链接| Landing[客户 Landing Page]
 ```
 
-Channel 帖子同时提供落地页直接链接；加入频道不会自动启动 Bot 或私信成员。本项目使用客户已有的落地页，不生成页面，也不统计点击、注册或成交归因。两个卡片服务都支持私聊 `/start`，同一个 Bot 只能选择一个 Webhook 接收服务。
+`auto-register/api/server.js` 提供 HTTP 入口和 Telegram 登录/创建流程；`auth.js` 与 `auth-runtime.js` 管理鉴权、Redis 和邮件；`conversion.js` 管理客户配置、Webhook、频道和帖子；`store.js` 与 `schema.js` 管理 MySQL 数据和启动初始化。
 
-### 准备
+### 身份和凭据
 
-- 已注册的个人 Telegram 账号，能够接收登录验证码。
-- 在 [my.telegram.org](https://my.telegram.org) → API development tools 获取 App `api_id` 和 `api_hash`；它们与 Bot Token 不同。
-- Docker、Docker Compose、可访问的现有 MySQL 和 Redis，以及 SMTP 发信服务。
-- 首次需完成验证码及可能的两步验证密码校验，网页端登录不会自动授权本服务。
+| 标识或凭据 | 用途 | 有效期或归属 |
+| --- | --- | --- |
+| user_id | 平台用户，API 的 user.id 对应 user_info.id | 邮箱验证成功后创建 |
+| access_token | 调用本服务的 Bearer 登录令牌 | 默认 2 小时，Redis 保存其摘要对应的登录态 |
+| challenge_id + 邮件 code | 完成一次平台注册或登录验证 | 默认 10 分钟，成功后销毁，最多错误 5 次 |
+| account_id | 本服务保存的一次 Telegram 登录及后续资源的标识 | UUID，关联 user_id，本身不能用于鉴权 |
+| api_id / api_hash | Telegram App 凭据 | 用于 MTProto 个人账号认证，不是 Bot Token |
+| Telegram session | 已认证的个人账号会话 | 存 MySQL，撤销方式为 Telegram 客户端设备列表 |
+| Bot Token | 调用 Telegram Bot API | 存 MySQL bot_info，查询需平台鉴权及账号归属 |
+| customer_id | Bot 对应客户的业务标识 | 不能代替平台身份，不是权限隔离依据 |
+| request_key | 频道或帖子请求的稳定标识 | 频道在账号下唯一，帖子在频道内唯一 |
 
-### Docker 部署
+### 四张业务表
 
-整套 Docker API 只需构建 `auto-register/` 一个目录。这个镜像包含平台鉴权、Telegram 登录、Bot 创建、落地页卡片回复、Webhook、Channel 创建和帖子发布，MySQL、Redis 使用环境变量指定的现有服务。
+| 表 | 保存内容 | 关联关系 |
+| --- | --- | --- |
+| user_info | 用户 ID、唯一邮箱、随机盐的 scrypt 密码哈希、注册时间 | id 为平台用户主键 |
+| tg_info | account_id、App 凭据、手机号、session、登录阶段、phone_code_hash、pending_bot/pending_channel | user_id 对应平台用户 |
+| bot_info | Bot ID、用户名、名称、Token、customer_id、落地页、卡片和 Webhook 配置 | user_id 和 account_id 对应所属用户与 Telegram 登录 |
+| channel_info | 频道 ID、access_hash、邀请链接、Bot/客户关联、创建状态及 posts JSON | user_id、account_id；posts 保存各帖子状态和 random_id |
 
-`card-bot/` 是可选的独立 Cloudflare Worker；使用 Docker API 回复卡片时无需构建或部署它。只有选择 Worker 作为某个 Bot 的卡片入口时，才按第二部分单独部署 `card-bot`。
+这些关系由服务校验并建立查询索引，目前没有数据库外键级联删除。所有账号资源路径先检查用户归属，访问其他用户的账号返回 404。新 Telegram 登录直接写 tg_info，不再创建 JSON 会话文件；MySQL 中的可复用 session、App hash、Bot Token 和 Webhook Secret 需要保护数据库访问和备份。
 
-以下 API 命令均在 `auto-register/` 目录执行：
+### 项目目录
 
-```bash
-cd auto-register
+```text
+auto-register/              当前主服务；唯一需要构建的 Docker 目录
+  api/                      Node.js API、鉴权、Telegram、MySQL 存储
+  AUTH.md                   邮件验证、Redis TTL、限流和旧会话迁移
+  CONVERSION.md             客户卡片、Channel 和重试说明
+  test/                     单元测试与可选 MySQL/Redis 集成测试
+  scripts/assign-account.js 管理员导入旧 JSON 会话
+  scripts/create-bot.js     独立本地创建工具，不走平台 API
+  sql/init.sql              可选的手工建库建表 SQL
+  Dockerfile                Node.js 22 Alpine API 镜像
+  compose.yaml              API 部署；外接已有 MySQL 和 Redis
+  .env.example              配置模板，真实 .env 不提交
+card-bot/                   Legacy：独立 Cloudflare 卡片 Worker
+  README.md                 Legacy 完整配置与部署说明
+  src/index.js              私聊 Start 卡片回复
+  scripts/                  Legacy Webhook 注册脚本
 ```
 
-```bash
-if [ ! -f .env ]; then cp .env.example .env; fi
-chmod 600 .env
-# 编辑 .env：设置随机 AUTH_HMAC_SECRET（至少 32 字符）、MySQL、Redis 和 SMTP 配置，可选填 App 凭据等默认值
-# 生成随机密钥：openssl rand -hex 32
-docker compose up -d --build
-```
+根目录 `npm run start:api`、`npm test`、`npm run create:bot` 转发到主服务；`npm run check` 检查两个目录。根目录 `npm run dev`、`npm run deploy` 仍是 Legacy Worker 命令，主服务使用下文 Docker 命令。
 
-默认仅监听宿主机 `127.0.0.1:3100`。所有管理请求必须携带 `Authorization: Bearer <access_token>`。远程访问可通过 HTTPS 反向代理。健康检查为 `GET /health`。以下命令中的值均为占位符，使用自己的实际配置。
+<a id="configuration"></a>
 
-SMTP 可以暂时留空，服务仍会启动；`/auth/register/start` 和 `/auth/login/start` 在需要发信时返回 503，不能完成真实邮箱注册或登录。可以先验证 Docker、MySQL、Redis 和本地模拟邮件链路。`PUBLIC_BASE_URL` 也可留空，注册 Bot Webhook 时再配置。
+## 3. 环境变量与配置需求
+
+### 按阶段配置
+
+| 使用阶段 | 必要配置或条件 |
+| --- | --- |
+| 基础服务启动 | AUTH_HMAC_SECRET、MySQL 连接和库名、Redis 连接；Docker/Compose、MySQL 8.0+、Redis 6.0+ |
+| 真实平台注册和登录 | 在基础配置上增加 SMTP_HOST、SMTP_FROM，按邮件服务要求配置端口、TLS 和密码 |
+| Telegram 登录和创建 | 已注册的个人 Telegram 账号及 App 凭据；用户在请求中传入或配置 TG_* 默认值 |
+| Bot 卡片自动回复 | 已保存客户卡片配置、PUBLIC_BASE_URL、公网 HTTPS 转发到 API，并调用注册 Webhook 接口 |
+| Channel 创建和发布 | 有效 Telegram session、已保存并配置 landing 的 Bot，不要求 PUBLIC_BASE_URL |
+
+SMTP 暂时留空仍可启动基础服务，发送验证码时返回 503，不能完成真实邮箱注册或登录。PUBLIC_BASE_URL 可留空，注册 Webhook 时再填写。MySQL、Redis 和 SMTP 都是外部服务，本项目的 Compose 不创建它们。
+
+### 服务环境变量
 
 | 环境变量 | 必填 | 默认值 | 用途和格式 |
 | --- | --- | --- | --- |
@@ -124,9 +157,67 @@ SMTP 可以暂时留空，服务仍会启动；`/auth/register/start` 和 `/auth
 | PORT | 否 | `3000` | Node.js 服务端口；Dockerfile 设置为 3000，Compose 不透传自定义值 |
 | DATA_DIR | 否 | 本地 `./data`；容器 `/data` | 仅旧 JSON 会话迁移读取目录；新会话存 MySQL |
 
-Dockerfile 使用 Node.js 22、非 root 用户运行，并内置 HTTP 健康检查。仅 API 代码和依赖进入镜像，真实 `.env` 和登录数据不进入镜像。使用现有 MySQL 时不需要部署新数据库容器。
+REDIS_URL 优先于 REDIS_HOST/PORT/DB/USER/PASSWORD。没有 URL 时至少配置 HOST；带有账号密码的 URL 使用连接 URI 所需的编码。Compose 默认 REDIS_HOST 为 host.docker.internal，MySQL Host 由 .env 必填。
 
-可单独构建镜像并运行（同样使用环境变量和持久化卷）：
+在 API 容器中 localhost 指向 API 容器本身。宿主机已发布 MySQL/Redis 端口时，可用 host.docker.internal；Compose 已配置 Linux host-gateway。直接在宿主机运行 Node.js 时应使用本机可解析的数据库/Redis 地址。
+
+AUTH_HMAC_SECRET 在各 API 实例间保持一致。Compose 的 API_PORT 只控制宿主机端口，容器内 PORT 固定为 3000；如修改宿主机端口，下面 curl 示例和 TEST_API_URL 也需调整。SMTP_SECURE、SMTP_REQUIRE_TLS 使用 true/false 字符串；587 通常使用 STARTTLS，465 使用隐式 TLS。
+
+### 管理及测试专用变量
+
+| 变量 | 使用位置 | 说明 |
+| --- | --- | --- |
+| MIGRATE_ACCOUNT_ID | assign:account 管理脚本 | 需要导入的旧 JSON 会话 UUID |
+| MIGRATE_EMAIL | assign:account 管理脚本 | 已完成平台注册的归属邮箱 |
+| DATA_DIR | assign:account 管理脚本 | 本地默认 ./data，Compose 固定 /data，只读取旧会话 |
+| INTEGRATION_TEST | 集成测试 | 设为 1 才执行真实 MySQL/Redis 和 HTTP 集成验证 |
+| TEST_API_URL | 集成测试 | 默认 http://127.0.0.1:3100；目标 API 需使用相同数据与鉴权配置 |
+
+TG_PHONE_CODE、TG_PASSWORD、TG_SESSION_PATH 和 TG_TOKEN_FILE 仅供独立本地创建脚本使用；HTTP API 的验证码及两步验证密码通过 verify 请求提交。
+
+<a id="build-and-verify"></a>
+<a id="docker-部署"></a>
+
+## 4. Docker 构建、部署和更新
+
+### 首次部署
+
+从仓库根目录开始，只构建 auto-register。镜像包含鉴权、Telegram 登录、Bot 创建、客户卡片/Webhook、Channel 和帖子功能，运行用户为 node。构建阶段通过 npm ci --omit=dev 安装锁定版本依赖，不登录 Telegram、不发邮件、不创建 Bot。
+
+```bash
+cd auto-register
+if [ ! -f .env ]; then cp .env.example .env; fi
+chmod 600 .env
+# 生成随机密钥，将输出填入 .env 的 AUTH_HMAC_SECRET；已有密钥应保留。
+openssl rand -hex 32
+# 编辑 .env，填写 MySQL、Redis 等实际配置。SMTP 可以稍后填写。
+docker compose config --quiet
+docker compose up -d --build telegram-api
+```
+
+启动时先创建 MYSQL_DATABASE 指定的库及四张业务表，再连接 Redis，成功后才监听 HTTP；初始化或连接失败时启动失败。默认宿主机监听 127.0.0.1:3100，远程 API 访问通过 HTTPS 反向代理转发。PUBLIC_BASE_URL 是该 API 的公网 HTTPS 源地址，如 https://bots.example.com，不含路径、查询参数或认证信息，注册后回调路径为 /webhooks/:bot_id。
+
+### 更新与健康检查
+
+```bash
+# 在 auto-register/ 中构建当前检出版本并使用该镜像启动。
+docker compose build telegram-api
+docker compose up -d --no-build telegram-api
+docker compose ps
+docker compose images
+docker compose logs --tail 50 telegram-api
+curl -i http://127.0.0.1:3100/health
+# 未登录的业务请求应返回 HTTP 401。
+curl -i http://127.0.0.1:3100/v1/accounts
+```
+
+正常日志包含 Telegram API service started，health 返回 HTTP 200 和 {"ok":true}。容器每 30 秒做 HTTP 健康检查，启动后可能先显示 starting，随后变为 healthy；该检查不实时探测 MySQL、Redis 或 Telegram 授权。
+
+修改环境变量时执行 docker compose up -d telegram-api 重新创建容器；restart 不加载新容器环境变量。更新代码时先 build 再 up，保留原 MYSQL_DATABASE、Redis DB/键前缀、AUTH_HMAC_SECRET 和 Compose 项目名。需要刷新基础镜像时可按需使用 docker compose build --pull --no-cache telegram-api。
+
+### 单独运行镜像
+
+也可在 auto-register/ 目录使用 Dockerfile 构建并运行，选择一种部署方式并保留对应卷名：
 
 ```bash
 docker build -t telegram-card-bot-api:local .
@@ -136,75 +227,22 @@ docker run -d --name telegram-card-bot-api --restart unless-stopped \
   telegram-card-bot-api:local
 ```
 
-单独使用 `docker run` 时端口由 `-p` 参数指定；`API_PORT` 只供 Compose 插值。两种部署方式使用不同的卷名，选择一种并在后续部署中保留同一个卷。Compose 固定项目名为 `telegram-card-bot-github`，目录重组后继续使用原容器和 `telegram-card-bot-github_telegram-data` 卷；若改项目名，也需显式复用原卷才能迁移旧会话。
+Compose 固定项目名 telegram-card-bot-github，使用 telegram-card-bot-github_telegram-data 卷；docker run 示例使用另一个卷。/data 只用于旧会话迁移，新会话由外部 MySQL 持久化。
 
-<a id="build-and-verify"></a>
+### 宿主机开发运行
 
-### Docker 构建、更新和验证
-
-以下命令从仓库根目录开始。API 使用 Node.js 22 Alpine 镜像，通过 `npm ci --omit=dev` 安装锁定版本的运行依赖；运行用户为 `node`。构建不需要真实 Telegram 凭据，也不会登录 Telegram、创建 Bot 或发邮件。容器启动时才读取环境变量，自动初始化 MySQL 四张业务表并连接 Redis。
+本地使用 Node.js 22，可以在 auto-register/ 中直接运行 API。.env 不会由 npm 自动加载，以下命令显式加载文件；MySQL/Redis 地址需在宿主机可访问，端口由 PORT 控制，默认 3000：
 
 ```bash
 cd auto-register
-
-# 只校验配置，不输出展开后的环境变量值。
-docker compose config --quiet
-
-# 构建当前检出版本，再使用该镜像启动或更新服务。
-docker compose build telegram-api
-docker compose up -d --no-build telegram-api
-
-# 检查运行状态、镜像和启动日志。
-docker compose ps
-docker compose images
-docker compose logs --tail 50 telegram-api
-curl -i http://127.0.0.1:3100/health
-
-# 未登录的业务接口应返回 HTTP 401。
-curl -i http://127.0.0.1:3100/v1/accounts
+npm ci
+node --env-file=.env api/server.js
 ```
-
-正常启动日志包含 `Telegram API service started`；`/health` 返回 HTTP 200 和 `{"ok":true}`。Docker 健康检查每 30 秒执行一次，刚启动时可能显示 `starting`，随后变为 `healthy`。健康检查仅验证 HTTP 服务，不实时探测 MySQL、Redis 或 Telegram 授权。
-
-更新代码或修改 `.env` 后重新执行 build/up 两条命令即可。只有环境变量变化时可以只运行 `docker compose up -d telegram-api`；`docker compose restart` 不会加载新的容器环境变量。更新时继续使用原 MYSQL_DATABASE、Redis 连接/前缀、AUTH_HMAC_SECRET 和 Compose 项目名，保留用户、Telegram 会话及尚未过期的平台登录态。
-
-如需重新拉取基础镜像并从头构建，可按需执行 `docker compose build --pull --no-cache telegram-api`。Compose 仅部署 API，不新建 MySQL、Redis 或 SMTP 容器。MySQL 需要支持 JSON 的 8.0 或更新版本，Redis 需要 6.0 或更新版本。旧 JSON 卷只用于迁移，新会话存储在 MySQL 的 tg_info 中。
-
-源码检查和基础测试使用本地 Node.js 22，在仓库根目录执行：
-
-```bash
-npm --prefix auto-register ci
-npm run check
-npm test
-```
-
-真实 MySQL/Redis 与已启动 API 的集成验证在 `auto-register/` 目录执行，使用同一数据库、Redis DB/键前缀和鉴权密钥：
-
-```bash
-cd auto-register
-# MySQL、Redis 均映射到宿主机端口时可使用以下地址。
-# REDIS_URL 若已填写，仍优先于 REDIS_HOST；其他环境参数从 .env 读取。
-INTEGRATION_TEST=1 MYSQL_HOST=127.0.0.1 REDIS_HOST=127.0.0.1 \
-  TEST_API_URL=http://127.0.0.1:3100 \
-  node --env-file=.env --test test/integration.test.js
-```
-
-如使用远程数据库或其他 API_PORT，将上述地址改为实际值。集成测试创建临时用户及业务记录，完成后清理；通过进程内 SMTP 接收器验证验证码邮件，不要求填写 SMTP，也不调用真实 Telegram 创建接口。该测试按默认 TTL 600/7200 秒验证有效期。
-
-| 已验证项目 | 结果和范围 |
-| --- | --- |
-| Docker 镜像构建、容器启动、健康检查 | 已通过，本地 HTTP 200 |
-| MySQL 自动初始化、四表读写 | 已通过，临时用户记录已清理 |
-| Redis 验证码与登录态 | 已通过，默认 TTL 600/7200 秒、一次性使用、过期和退出 |
-| 平台鉴权和用户隔离 | 已通过，未登录 401，其他用户访问账号资源 404 |
-| SMTP 邮件验证码链路 | 本地 SMTP 接收器及 HTTP 验证通过，真实邮箱投递待配置 |
-| 客户卡片、Channel 恢复和帖子重试 | 模拟 Telegram 测试通过 |
-| 真实 Telegram 登录 | 此前已验证；旧 JSON 会话升级需先指定归属后迁移 |
-| 真实 BotFather/Channel 创建、频道发布、公网 Webhook | 尚未实测 |
 
 <a id="api-reference"></a>
+<a id="1-bot-自动化创建和客户转化流程"></a>
 
-### API 使用约定和接口明细
+## 5. API 清单与完整调用示例
 
 本地 Base URL 为 `http://127.0.0.1:3100`。API 用 JSON 接收参数并返回 JSON，POST / PUT 请求设置 `Content-Type: application/json`，请求体最大 16 KiB，所有成功请求当前均返回 HTTP 200。下面的步骤 0 给出完整平台鉴权示例，[AUTH.md](auto-register/AUTH.md) 补充限流和旧会话迁移规则。
 
@@ -346,13 +384,13 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/verify \
 curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots \
   -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' \
   -H 'Content-Type: application/json' \
-  -d '{"name":"Gatherstar Card Bot","username":"gatherstar_unique_card_bot"}'
+  -d '{"name":"客户 A 助手","username":"customer_a_unique_bot"}'
 ```
 
 响应示例：
 
 ```json
-{"username":"gatherstar_unique_card_bot","name":"Gatherstar Card Bot","token":"123456:EXAMPLE_TOKEN","url":"https://t.me/gatherstar_unique_card_bot"}
+{"username":"customer_a_unique_bot","name":"客户 A 助手","token":"123456:EXAMPLE_TOKEN","url":"https://t.me/customer_a_unique_bot"}
 ```
 
 `name`、`username` 可分别由 `TG_BOT_NAME`、`TG_BOT_USERNAME` 提供默认值。BotFather 对话依赖英文提示，用户名占用、账号限制或回复变化会返回错误；超时后先检查 BotFather 对话，避免重复创建。不要同时手动操作该账号的 BotFather。服务只对已成功保存的结果去重，无法保证远程创建与本地写入之间的事务一致性。
@@ -447,7 +485,7 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/channels/customer_a_channel_00
 ```bash
 curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID \
   -H 'Authorization: Bearer YOUR_ACCESS_TOKEN'
-curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/gatherstar_unique_card_bot \
+curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique_bot \
   -H 'Authorization: Bearer YOUR_ACCESS_TOKEN'
 ```
 
@@ -455,7 +493,11 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/gatherstar_unique_card_bo
 
 账号 GET 只返回本地状态，`authorized` 不代表本次请求实时验证了 Telegram。创建新 Bot、创建 Channel、发布帖子会检查实际授权；缓存结果或配置查询不验证用户会话。当前没有单独的实时会话校验 API。
 
-### 常见错误和处理
+<a id="operations"></a>
+
+## 6. 错误处理、持久化和迁移
+
+### HTTP 错误与处理
 
 失败返回 `{"error":"错误说明"}`，不会返回 App 密钥或用户会话。
 
@@ -478,54 +520,48 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/gatherstar_unique_card_bo
 
 同一 account_id 和用户名已有数据库记录时，创建接口直接返回已保存 Token；更改 name 不会更新已有 Bot。它不提供 Token 轮换、删除 Bot 或导入已有 Bot 功能。
 
-### 数据持久化、初始化和维护
+邮件验证码最多错误 5 次，正确验证后即销毁。同一邮箱发信间隔为 60 秒，默认验证码有效期窗口内最多 5 次；鉴权 start 同一来源 IP 最多 20 次，verify 最多 60 次，邮箱密码检查最多 10 次。Redis 不可用时受保护接口不会放行。服务按 TCP 来源 IP 限流，不信任转发头；反向代理后的用户会共用来源 IP 限额，详见 [AUTH.md](auto-register/AUTH.md)。
 
-服务启动时自动创建 `MYSQL_DATABASE` 指定的数据库及四张业务表。库名仅允许 1–64 位字母、数字或下划线。初始化失败或 Redis 连接失败时不会开始接受请求。Compose 只启动 API，使用已有 MySQL 和 Redis。
+### 状态与重试
 
-| 表或数据位置 | 保存内容 |
-| --- | --- |
-| MySQL `user_info` | 用户 ID、唯一邮箱、随机盐的 scrypt 密码哈希 |
-| MySQL `tg_info` | user_id、account_id、App 凭据、手机号、MTProto session、登录阶段及待补写结果 |
-| MySQL `bot_info` | user_id、account_id、Bot ID、用户名、名称、Token、客户落地页、卡片及 Webhook 配置 |
-| MySQL `channel_info` | user_id、account_id、Bot/客户关联、频道 ID、access_hash、邀请链接和 posts JSON 中的帖子记录 |
-| Redis | 邮件验证码 challenge 默认 10 分钟；平台登录令牌默认 2 小时；限流计数和 Telegram 操作锁 |
+| 流程 | 保存或返回的状态 | 继续方式 |
+| --- | --- | --- |
+| 邮件验证 | email_code_required；验证后销毁 challenge | 同一 challenge/code 只可成功一次；过期后重新发起 start |
+| Telegram 登录 | code_required → password_required（必要时）→ authorized | 使用同一个 account_id 提交 code/password，10 分钟流程过期后重新登录 |
+| Channel 创建 | creating → created → ready | ready 返回保存结果；created 可用原 request_key 继续生成邀请链接；creating 需先核对远程结果 |
+| 帖子发布 | sending → sent | 原 request_key 和参数重试；发送中复用保存的 random_id，已发送直接返回记录 |
+| 平台登录态 | Redis 中存在且未过期才有效 | 默认 2 小时，访问不续期；退出或过期后重新进行平台登录 |
 
-新登录状态直接写 MySQL，不再生成 `<account_id>.json`。原命名卷保留，用于管理员迁移旧 JSON 会话；具体命令见 [旧会话迁移](auto-register/AUTH.md#旧-json-会话迁移)。旧表不会自动删除或向新用户开放。升级时需确认归属再迁移旧 Bot、客户和 Channel 记录。
+频道 request_key 与帖子 request_key 是两个不同范围的标识。重试时保留原参数；改变频道配置或帖子正文/落地页但复用原 key 会返回 409。不要在结果不确定时直接改 key 重复创建资源。
 
-数据库保存可复用的 Telegram session、App hash、Bot Token 和 Webhook Secret，应限制数据库访问并保护备份。远程创建结果会写入 tg_info 的 pending 字段，后续同账号请求先补写业务表；若首次 pending 写入本身失败，必须先检查 BotFather 或 Telegram 中的实际创建结果。服务不会回滚远程资源。
+### 初始化、备份和退出
 
-本地 MySQL 或 Redis 已映射宿主机端口时，Compose 可用 `host.docker.internal` 连接，模板已配置 host-gateway。容器中 `localhost` 指向 API 容器。MySQL 用户需具有目标库的 CREATE、SELECT、INSERT、UPDATE 权限。所有连接信息通过 `.env` 或容器环境变量传入，真实 `.env` 不进入镜像，也不提交 Git。
-
-通常无需手动导入 SQL；[sql/init.sql](auto-register/sql/init.sql) 可预先建库建表，默认数据库名 `telegram_bot`。如果使用其他 MYSQL_DATABASE，请同步修改 SQL 的 CREATE DATABASE 和 USE。初始化使用 IF NOT EXISTS，不清空数据，也不自动改动已有同名表结构。
+库表初始化使用 IF NOT EXISTS，不清空数据、不自动变更已有同名表结构。MySQL 用户需具有 CREATE、SELECT、INSERT、UPDATE 权限。可选的 [sql/init.sql](auto-register/sql/init.sql) 默认使用 telegram_bot；手动导入其他库时先修改 CREATE DATABASE 和 USE，使其与 MYSQL_DATABASE 一致：
 
 ```bash
-# 在 auto-register/ 目录；密码通过提示输入。
+# 在 auto-register/ 中，密码通过提示输入。
 mysql -h 127.0.0.1 -P 3306 -u root -p < sql/init.sql
-
-docker compose ps
-docker compose logs --tail 50 telegram-api
-curl http://127.0.0.1:3100/health
-docker compose restart telegram-api
 ```
 
-重启后仍使用原 account_id；平台令牌在 Redis 中未过期即可继续使用，MySQL 的 Telegram session 可以长期复用。平台退出接口 `/auth/logout` 仅撤销当前平台令牌。要终止 Telegram 会话，在 Telegram 客户端设置的设备列表中撤销；Bot 和 Token 不会因此删除。
+MySQL 备份保存用户、Telegram session、Bot Token、卡片和频道。Redis 丢失登录态会要求重新进行平台登录，但 MySQL 中的 Telegram 会话仍保留。平台 /auth/logout 只撤销当前令牌；终止 Telegram 登录需在 Telegram 客户端设备列表撤销相应会话，不会删除 Bot、频道或 Token。
 
-非 Docker 运行需加载同样的环境变量，再执行 `npm run start:api`。默认 Node.js 端口为 3000，可设置 PORT。`docker compose down` 保留卷；`down -v` 删除旧会话卷，但不会删除外部 MySQL 或 Redis 数据。
+远程创建结果先写入 tg_info.pending_bot 或 pending_channel，再补写业务表；后续同账号请求会尝试恢复已保存结果。若最初 pending 写入也失败，应检查 BotFather/Telegram 实际资源后再决定重试。远程 Telegram 操作和数据库写入没有跨系统事务，服务不会自动删除创建结果或回滚已发布帖子。
 
-### 检查与验证范围
+Docker compose down 保留迁移卷，down -v 会删除该卷；外部 MySQL 和 Redis 不由此 Compose 管理。真实 .env、旧会话及本地 Token 文件均不应提交 Git。
+
+### 旧 JSON 会话迁移
+
+升级保留旧 JSON 卷及旧表，不自动将其开放给新用户。归属邮箱先完成平台注册，再由管理员执行以下命令。account_id 保持原值，归属绑定不可覆盖成其他用户：
 
 ```bash
-npm run check
-npm test
+# 在 auto-register/ 中执行；先替换为实际归属信息。
+docker compose exec \
+  -e MIGRATE_ACCOUNT_ID=OLD_ACCOUNT_ID \
+  -e MIGRATE_EMAIL=you@example.com \
+  telegram-api npm run assign:account
 ```
 
-自动测试覆盖密码哈希、邮件验证码一次性使用和过期、登录态有效期、退出和资源归属，并模拟 Telegram 客户卡片、Channel 恢复与帖子重试。真实 MySQL/Redis 和已启动 API 的集成测试可在配置相同环境后运行：
-
-```bash
-INTEGRATION_TEST=1 node --env-file=.env --test test/integration.test.js
-```
-
-本地测试时 MYSQL_HOST、REDIS_HOST 必须能从宿主机访问；REDIS_URL 如配置则优先使用。该测试创建并清理临时记录，使用进程内的 SMTP 接收器捕获邮件，不向外部邮箱发信、不调用 Telegram。真实 SMTP 发信需配置后验证。此前真实 Telegram 验证码登录及会话授权已通过；真实 BotFather/Channel 创建、频道发布及公网 Webhook 尚未实测。
+此脚本只导入旧 JSON 的 Telegram 会话至 tg_info，不删除原文件；旧 Bot、客户和频道表需管理员确认归属后另行迁移。没有 HTTP 认领接口，不能仅凭知道旧 account_id 取得它的访问权。完整规则见 [AUTH.md](auto-register/AUTH.md#旧-json-会话迁移)。
 
 ### 可选：通过 Node.js 脚本自动创建 Bot
 
@@ -566,140 +602,74 @@ npm run create:bot
 
 脚本只从环境变量读取创建配置；也可由终端或密钥管理工具直接注入，无需配置文件。`source` 会执行 Bash 语法，只加载自己填写的可信文件。可通过 `TG_PHONE_CODE`、`TG_PASSWORD` 环境变量传入登录验证码和两步验证密码；未提供时在终端输入；验证码会过期，建议临时注入。用户会话有效时，后续运行可复用登录。
 
-成功后 Token 写入 `TG_TOKEN_FILE`，格式为 `BOT_TOKEN=...`，文件仅当前用户可读写，不在终端显示 Token。脚本会拒绝覆盖已有输出文件。将该值填入下文 Cloudflare 的 `BOT_TOKEN` Secret 和 `scripts/env` 的 `BOT_TOKEN`；不会自动部署 Worker 或注册 Webhook。
+成功后 Token 写入 `TG_TOKEN_FILE`，格式为 `BOT_TOKEN=...`，文件仅当前用户可读写，不在终端显示 Token。脚本会拒绝覆盖已有输出文件。需要 Legacy Worker 时，将该值填入其 `BOT_TOKEN` Secret 和 `scripts/env` 的 `BOT_TOKEN`；不会自动部署 Worker 或注册 Webhook。
 
 不要同时手动操作 BotFather 或运行多个创建脚本。脚本依赖 BotFather 的英文提示，用户名占用、创建限制、回复变化或超时会停止流程；重新运行前检查 BotFather 对话，确认是否已创建成功，避免重复创建。脚本属于对话自动化，没有官方独立的 `createBot` HTTP 接口，尚未完成真实账号创建实测。
 
 `scripts/create-bot.env`、默认 Token 输出和会话文件已被 Git 忽略。若自定义输出路径，请自行确认不会提交到 Git。会话文件可用于访问个人账号，应与 `api_hash`、Bot Token 一并保密。详见 [BotFather 流程](https://core.telegram.org/bots/features#creating-a-new-bot)、[用户授权](https://core.telegram.org/api/auth) 和 [Teleproto](https://docs.teleproto.dev/)。
 
-## 2. Telegram Card Bot
+<a id="verification"></a>
 
-Cloudflare Workers 使用已有 Bot Token，在私聊收到 `/start` 后发送固定图片、文案和网址按钮。无图片时发送文字和按钮。每个部署使用一组 Worker 环境变量，卡片服务无需 MySQL 或个人账号会话。适合已创建 Bot 的独立卡片接入。
+## 7. 测试与当前验证范围
 
-如果已使用上方 Docker 的客户配置和 Webhook，可以由 Docker 直接发送卡片；Cloudflare Worker 是另一种部署选项。同一个 Bot 注册到 Worker 后会替换 Docker Webhook，反之亦然。
+### 源码检查及单元测试
 
-### 准备
-
-以下卡片服务命令均在 `card-bot/` 目录执行：
+使用本地 Node.js 22，在仓库根目录执行：
 
 ```bash
-cd card-bot
+npm --prefix auto-register ci
+npm run check
+npm test
 ```
 
-- 使用上方 API 创建 Bot 获取 Token，或在官方 @BotFather 通过 `/newbot` 手动创建。
-- 注册 Cloudflare 账号，准备卡片图片直链和文案。
-- Token 通常是 `数字ID:密钥`，Bot 用户名和普通账号 ID 不是 Token。
-- 不要提交真实 Token 或 Webhook 密钥；`.dev.vars.example` 只是配置模板，不会自动配置线上变量。
+普通测试覆盖密码哈希、验证码一次性使用/错误次数/过期、平台登录态/退出、故障时拒绝鉴权、邮件冷却和手机号操作锁，并模拟客户卡片、Channel 恢复与帖子重试。真实集成测试默认跳过。
 
-### 使用流程
+### 真实 MySQL/Redis 和 HTTP 集成验证
 
-1. 准备 Bot Token、落地页网址，以及可选的图片和文案。
-2. 将 `src/index.js` 部署到 Cloudflare Workers。
-3. 设置 Worker 运行时变量和 Secrets，保存并部署。
-4. 在本地配置 `scripts/env`，运行注册 Webhook 脚本。
-5. 打开 `https://t.me/你的机器人用户名`，点击 Start 或发送 `/start`。
-
-只响应私聊中的 `/start`（可带参数），忽略其他消息和群聊。配置了 `CARD_IMAGE` 时发送图片、文案和网址按钮；没有图片时发送文字和按钮。网址按钮只打开配置的网址，不在 API 服务中记录点击。
-
-### 部署到 Cloudflare Workers
-
-Cloudflare 控制台 → Workers & Pages → 创建应用 → 从 Git 仓库导入，选择本仓库。
-
-- 部署命令：`npx wrangler deploy`
-- 项目根目录：`card-bot`。
-- 本项目无需构建；如果要求构建命令，可填写 `npm run check`。
-
-也可以创建 Hello World Worker，在代码编辑器粘贴 `card-bot/src/index.js` 并部署。使用提供的 `workers.dev` 地址，无需自有域名。
-
-### 配置运行时变量
-
-Worker → Settings → Variables and Secrets，添加并保存部署：
-
-| 名称 | 类型 | 必填 | 默认值/格式 | 用途 |
-| --- | --- | --- | --- | --- |
-| BOT_TOKEN | Secret | 是 | `数字ID:密钥` | 调用 Telegram Bot API；不是 App api_hash |
-| WEBHOOK_SECRET | Secret | 是 | 1–256 位字母、数字、下划线或短横线，建议随机 32 位以上 | 验证 Telegram 请求，需与本地注册配置一致 |
-| WEBHOOK_PATH | Text | 否 | `/webhook` | 接收 Webhook 的路径；修改后重新注册 |
-| LANDING_URL | Text | 是 | 完整 `http://` 或 `https://` URL，可带查询参数 | 网址按钮目标 |
-| CARD_IMAGE | Text | 否 | 空 | 公网图片直链或 Telegram file_id |
-| CARD_TEXT | Text | 否 | `欢迎访问平台` | 有图最多 1024、无图最多 4096 个 JavaScript 字符，普通文本 |
-| BUTTON_TEXT | Text | 否 | `立即进入平台` | 网址按钮文字 |
-
-配置的是 Worker 运行时变量，不是 Git 构建环境变量。业务值不写入 wrangler 配置，方便在控制台修改。
-
-### 本地开发
-
-本地开发使用 `.dev.vars`，与 API 的 `.env` 独立：
+先启动 API，再在 auto-register/ 执行，使用与 API 一致的数据库、Redis DB/前缀、AUTH_HMAC_SECRET 和默认 TTL 600/7200 秒：
 
 ```bash
-npm ci
-cp .dev.vars.example .dev.vars
-# 编辑 .dev.vars，填写上表的 Bot Token、Webhook 密钥、落地页等
-npm run dev
+cd auto-register
+# 示例假设 MySQL 和 Redis 发布到宿主机端口；远程连接时调整地址。
+# REDIS_URL 如已配置，仍优先于 REDIS_HOST。
+INTEGRATION_TEST=1 MYSQL_HOST=127.0.0.1 REDIS_HOST=127.0.0.1 \
+  TEST_API_URL=http://127.0.0.1:3100 \
+  node --env-file=.env --test test/integration.test.js
 ```
 
-Wrangler 显示本地地址；Telegram 注册 Webhook 需要可从公网访问的 HTTPS 地址，不能直接使用 localhost。通过 Cloudflare 控制台配置的线上变量不会自动写入本地 `.dev.vars`，本地配置也不会自动同步线上。
+测试通过进程内 SMTP 接收器捕获验证码邮件，再用 HTTP 验证接口取得登录令牌，检查四表读写、Redis TTL、验证码重放、退出和跨用户访问。该测试会创建并清理临时业务记录，不需要真实 SMTP，不调用 Telegram 创建接口。
 
-### 注册 Webhook
-
-注册脚本将公网 Worker URL 和校验密钥提交给 Telegram，并查询 Webhook 信息。它只配置消息接收入口，不会部署 Worker 或创建 Bot。复制模板：
-
-```bash
-cp scripts/env.example scripts/env
-chmod 600 scripts/env
-```
-
-编辑 `scripts/env`，填写：
-
-```ini
-BOT_TOKEN=你的BotFather令牌
-WEBHOOK_SECRET=与Cloudflare中完全一致的密钥
-WORKER_URL=https://你的worker.你的子域.workers.dev
-WEBHOOK_PATH=/webhook
-```
-
-| 配置 | 必填 | 说明 |
-| --- | --- | --- |
-| BOT_TOKEN | 是 | 与 Worker 的 BOT_TOKEN 完全一致 |
-| WEBHOOK_SECRET | 是 | 与 Worker 的 WEBHOOK_SECRET 完全一致 |
-| WORKER_URL | 是 | 公网 HTTPS 源地址，例如 `https://example.workers.dev`，不包含路径或查询参数 |
-| WEBHOOK_PATH | 否 | 默认 `/webhook`；必须与 Worker 使用的路径一致 |
-
-支持空行、整行 `#` 注释和包裹值的单引号/双引号；值按原文读取，不执行命令或展开变量。不要使用 `export` 或行尾注释。`scripts/env` 已被 Git 忽略，不提交密钥。建议执行 `chmod 600 scripts/env`。
-
-在 Bash 终端执行：
-
-```bash
-bash scripts/register-webhook.sh
-```
-
-脚本自动读取其所在目录的 `env`，不再交互输入。从 `scripts` 目录也可执行 `bash register-webhook.sh`。确认 setWebhook 返回 `ok: true`，getWebhookInfo 的 URL 正确。本地 env 只用于注册 Webhook，不会同步 Cloudflare 变量。
-
-### 测试和维护
-
-| Worker HTTP 状态 | 含义 |
+| 项目 | 已验证范围 |
 | --- | --- |
-| 200 | 已处理，或消息不属于私聊 `/start` 而被忽略 |
-| 400 | Webhook 请求不是有效 JSON |
-| 403 | Telegram Secret Header 与配置不一致 |
-| 404 | 请求路径不匹配 |
-| 405 | Webhook 路径收到非 POST 请求 |
-| 500 | 缺少密钥、落地页无效或文案超长 |
-| 502 | Telegram 发送接口失败或网络请求异常 |
+| Docker 构建、容器启动、健康检查 | 已通过，HTTP health 200，未登录业务请求 401 |
+| MySQL 初始化及四表读写 | 已通过，临时用户记录已清理 |
+| Redis 验证码和平台登录态 | 默认 TTL 600/7200 秒、一次性验证、过期及退出通过 |
+| 平台用户权限隔离 | 跨用户账号、Bot Token、客户卡片和频道访问返回 404 |
+| 邮件验证码发送与验证 | 进程内 SMTP 及 HTTP 验证通过，真实邮箱投递待配置 |
+| Telegram 个人账号登录 | 此前真实登录和会话授权已验证，旧 JSON 需按归属迁移 |
+| 客户卡片、频道恢复和帖子重试 | 模拟 Telegram 测试通过 |
+| 真实 BotFather/Channel 创建、帖子发布、公网 Webhook | 尚未实测 |
 
-进入 Bot，点击 Start 或发送 `/start`，确认收到卡片，点击按钮检查完整落地页地址。
+当前 API 不提供平台密码重置/刷新令牌、Telegram HTTP 退出或实时会话校验、Bot Token 轮换/删除/通用导入、公开频道用户名或邀请用户等接口；不会自动私信频道成员。account_id 状态查询只读保存记录，创建新资源时才检查实际 Telegram 授权。
 
-- 根路径返回 404、浏览器 GET 访问 Webhook 返回 405 是正常行为。
-- 无回复：检查 getWebhookInfo 和 Worker 日志。
-- 图片失败：检查直链是否能直接下载图片；先移除 CARD_IMAGE 验证文字发送。
-- 修改图片、文案、按钮、落地页：保存并部署变量即可。
-- 修改密钥、Token、路径或 Worker 地址：重新注册 Webhook。
+<a id="legacy-card-bot"></a>
+<a id="2-telegram-card-bot"></a>
 
-普通网址按钮无法强制使用 TG 内置浏览器，取决于客户端和用户设置。基础版没有持久化去重，Telegram 重试时可能重复发送。不提供点击统计。
+## 8. Legacy：card-bot
 
-## 参考文档
+card-bot 是原有的独立 Cloudflare Worker，使用已有 Bot Token，收到私聊 /start 后按 Worker 环境变量回复固定图片、文案和落地页按钮。这里的 Legacy 表示旧部署方式保留供已有部署使用，主服务的 Docker 构建不依赖此目录。
 
+新服务已经通过 bot_info 中每个 Bot 的客户配置和专属 Webhook 完成同样的回复流程，并提供用户鉴权、Telegram 登录、Bot 与频道创建。继续使用 Legacy 时，它的 Secrets 和 .dev.vars 独立于主服务 .env，不自动共享 MySQL 中的用户或卡片配置。
+
+同一个 Bot 只有一个 Webhook 接收入口。注册 Legacy Worker 会替换 Docker API 的该 Bot Webhook，注册 Docker API 也会替换 Worker；迁移时先保存该 Bot 的客户配置，再向所选入口注册 Webhook。
+
+Legacy 的完整环境变量、Cloudflare 部署、本地开发和注册脚本说明见 [card-bot/README.md](card-bot/README.md)。它只需要已有 Bot Token、Webhook Secret 和卡片配置，不负责主服务的账号注册或资源创建。
+
+## 相关文档
+
+- [auto-register 服务说明](auto-register/README.md)
+- [邮箱鉴权与旧会话迁移](auto-register/AUTH.md)
+- [客户卡片、Channel 与恢复说明](auto-register/CONVERSION.md)
+- [Legacy Worker 完整说明](card-bot/README.md)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
-- [BotFather 创建流程](https://core.telegram.org/bots/features#creating-a-new-bot)
 - [Telegram 用户授权](https://core.telegram.org/api/auth)
-- [Cloudflare Workers](https://developers.cloudflare.com/workers/)
