@@ -1,0 +1,55 @@
+{
+  "name": "telegram-cfworker-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "telegram_cfworker",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AUTH_STATE",
+        "class_name": "AuthState"
+      },
+      {
+        "name": "TELEGRAM_ACCOUNTS",
+        "class_name": "TelegramAccount"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AuthState",
+        "TelegramAccount"
+      ]
+    }
+  ],
+  "vars": {
+    "AUTH_CHALLENGE_TTL_SECONDS": "600",
+    "AUTH_SESSION_TTL_SECONDS": "7200",
+    "AUTH_STATE_PREFIX": "telegram-bot:",
+    "PUBLIC_BASE_URL": "",
+    "MAIL_API_URL": "https://api.resend.com/emails",
+    "MAIL_FROM": ""
+  },
+  "alias": {
+    "teleproto": "./node_modules/teleproto",
+    "teleproto/Password.js": "./node_modules/teleproto/Password.js",
+    "teleproto/sessions/index.js": "./node_modules/teleproto/sessions/index.js",
+    "big-integer": "./node_modules/big-integer"
+  }
+}

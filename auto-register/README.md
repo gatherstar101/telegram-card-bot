@@ -7,13 +7,13 @@ Node.js Docker 服务通过已登录个人 Telegram 账号创建 Bot 和私有 C
 - [构建、更新和检查](#构建更新和检查)
 - [API 接口清单](#api-接口清单)
 - [按步骤使用](#按步骤使用)
-- [完整 API 请求和响应示例](../README.md#api-reference)
+- [完整 API 请求和响应示例](DEPLOYMENT.md#api-reference)
 
 ## 设计与架构
 
 平台邮箱身份与个人 Telegram 账号分别认证。平台 access_token 默认 2 小时有效，由 Redis 管理；Telegram session 长期存入 MySQL，并通过 user_id 和 account_id 关联 Bot、客户卡片和 Channel。接口分步执行，所有账号路径校验用户归属。运行配置使用环境变量，每个用户的 App 凭据和业务内容通过 API 传入。
 
-完整的架构图、身份模型、四表关系及配置原则见 [主 README 架构说明](../README.md#architecture) 和 [环境变量需求](../README.md#configuration)。Legacy 独立卡片部署见 [card-bot 文档](../card-bot/README.md)。
+完整的架构图、身份模型、四表关系及配置原则见 [Docker 架构说明](DEPLOYMENT.md#architecture) 和 [环境变量需求](DEPLOYMENT.md#configuration)。Legacy 独立卡片部署见 [card-bot 文档](../card-bot/README.md)。
 
 ## 部署和配置
 
@@ -44,7 +44,7 @@ docker compose up -d --build
 
 从 my.telegram.org 的 API development tools 获取 App 凭据。App 凭据不等于 Bot Token，首次还需要验证个人账号。手机号使用 `+` 加国家区号和数字，不含空格。MySQL 在宿主机发布端口时可用 `MYSQL_HOST=host.docker.internal`；容器的 localhost 指向 API 容器自己。
 
-启动先建库及四张业务表并连接 Redis，成功后监听 API。完整 Redis 和 SMTP 变量及注册、后续登录步骤见 [AUTH.md](AUTH.md)。Dockerfile 使用 Node.js 22、非 root 用户和健康检查。完整的变量限制和 Docker run 部署方式见 [根 README 配置说明](../README.md#build-and-verify)。
+启动先建库及四张业务表并连接 Redis，成功后监听 API。完整 Redis 和 SMTP 变量及注册、后续登录步骤见 [AUTH.md](AUTH.md)。Dockerfile 使用 Node.js 22、非 root 用户和健康检查。完整的变量限制和 Docker run 部署方式见 [Docker 配置说明](DEPLOYMENT.md#build-and-verify)。
 
 SMTP 可以留空，基础服务仍能启动；注册/登录发送邮件时返回 503，真实邮箱鉴权需配置邮件服务后才能使用。PUBLIC_BASE_URL 可暂不填写，注册 Webhook 时再设置。
 
@@ -81,7 +81,7 @@ INTEGRATION_TEST=1 MYSQL_HOST=127.0.0.1 REDIS_HOST=127.0.0.1 \
   node --env-file=.env --test test/integration.test.js
 ```
 
-集成测试用进程内 SMTP 接收器捕获邮件，不要求配置外部 SMTP、不创建真实 Telegram 资源，完成后清理临时业务记录。有效期检查使用默认 600/7200 秒。完整镜像构建、更新和验证范围见 [根 README 构建说明](../README.md#build-and-verify)。
+集成测试用进程内 SMTP 接收器捕获邮件，不要求配置外部 SMTP、不创建真实 Telegram 资源，完成后清理临时业务记录。有效期检查使用默认 600/7200 秒。完整镜像构建、更新和验证范围见 [Docker 构建说明](DEPLOYMENT.md#build-and-verify)。
 
 ## API 接口清单
 
@@ -112,7 +112,7 @@ Base URL 默认为 `http://127.0.0.1:3100`。POST/PUT 使用 `Content-Type: appl
 
 Webhook Secret 通过 `X-Telegram-Bot-Api-Secret-Token` 请求头提交。所有账号资源都检查所属用户，访问其他人的 account_id 返回 404。平台令牌访问不续期，退出不撤销 Telegram 会话。密码为 12–128 字符，邮件 code 为六位数字；Telegram code 和 password 通过 verify 接口提交。
 
-完整 curl、请求字段限制、成功响应和错误码见 [根 README API 文档](../README.md#api-reference)，邮件限流及旧会话迁移见 [AUTH.md](AUTH.md)。
+完整 curl、请求字段限制、成功响应和错误码见 [根 README API 文档](DEPLOYMENT.md#api-reference)，邮件限流及旧会话迁移见 [AUTH.md](AUTH.md)。
 
 ## 按步骤使用
 
@@ -129,7 +129,7 @@ Webhook Secret 通过 `X-Telegram-Bot-Api-Secret-Token` 请求头提交。所有
 
 每次登录生成独立 account_id，API 返回后调用方保存；验证和后续创建使用同一个 ID。已有有效会话时从第 3 步继续。只有客户 Bot 卡片需求时第 5 步即完成；第 6、7 步用于频道投放。
 
-先按 [AUTH.md](AUTH.md) 注册/登录取得平台令牌。业务接口使用 `Authorization: Bearer <access_token>`；邮箱注册/登录接口不需要已有令牌，`/auth/me` 和 `/auth/logout` 需要。`/health` 公开；`/webhooks/:bot_id` 使用专属 Webhook Secret。POST/PUT 使用 JSON，字段和可直接执行的 curl 示例见 [根 README 完整步骤](../README.md#api-reference)。客户参数、Channel 幂等键和恢复行为也可参阅 [CONVERSION.md](CONVERSION.md)。
+先按 [AUTH.md](AUTH.md) 注册/登录取得平台令牌。业务接口使用 `Authorization: Bearer <access_token>`；邮箱注册/登录接口不需要已有令牌，`/auth/me` 和 `/auth/logout` 需要。`/health` 公开；`/webhooks/:bot_id` 使用专属 Webhook Secret。POST/PUT 使用 JSON，字段和可直接执行的 curl 示例见 [根 README 完整步骤](DEPLOYMENT.md#api-reference)。客户参数、Channel 幂等键和恢复行为也可参阅 [CONVERSION.md](CONVERSION.md)。
 
 用户点击频道中的 Bot 链接并按 Start 后，服务读取对应 Bot 的客户配置发送卡片；卡片按钮打开 Landing Page。帖子也包含落地页直接链接。不会自动私信频道成员，不生成落地页或统计成交。
 
@@ -160,4 +160,4 @@ npm run check
 npm test
 ```
 
-另有独立命令行创建脚本，配置 `scripts/create-bot.env` 后运行 `npm run create:bot`，仅保存本地会话和 Token；其配置明细见 [根 README](../README.md#可选通过-nodejs-脚本自动创建-bot)。
+另有独立命令行创建脚本，配置 `scripts/create-bot.env` 后运行 `npm run create:bot`，仅保存本地会话和 Token；其配置明细见 [根 README](DEPLOYMENT.md#可选通过-nodejs-脚本自动创建-bot)。

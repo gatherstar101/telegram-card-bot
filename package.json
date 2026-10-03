@@ -3,11 +3,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "npm --prefix auto-register run check && npm --prefix card-bot run check",
+    "check": "npm --prefix auto-register run check && npm --prefix card-bot run check && npm --prefix cfworker run check",
     "start:api": "npm --prefix auto-register run start:api",
     "create:bot": "npm --prefix auto-register run create:bot",
     "dev": "npm --prefix card-bot run dev",
     "deploy": "npm --prefix card-bot run deploy",
-    "test": "npm --prefix auto-register test"
+    "test": "npm --prefix auto-register test",
+    "cf:dev": "npm --prefix cfworker run dev",
+    "cf:build": "npm --prefix cfworker run build",
+    "cf:test": "npm --prefix cfworker test",
+    "cf:deploy": "npm --prefix cfworker run deploy"
   }
 }

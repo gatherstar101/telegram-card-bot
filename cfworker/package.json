@@ -1,0 +1,33 @@
+{
+  "name": "telegram-cfworker-api",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "test": "vitest run",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "configure": "node --env-file=.env scripts/configure.js",
+    "db:remote": "node --env-file=.env scripts/wrangler.js d1 migrations apply DB --remote",
+    "deploy": "node --env-file=.env scripts/wrangler.js deploy",
+    "probe:telegram": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/probe-telegram.js",
+    "check": "node --check src/index.js && node --check src/auth-state.js && node --check src/auth-runtime.js && node --check src/store.js && node --check src/telegram-account.js && node --check src/telegram-socket.js && node --check scripts/configure.js && node --check scripts/probe-telegram.js && node --check scripts/wrangler.js && node --check scripts/create-database.js && node --check scripts/secrets.js",
+    "db:create": "node --env-file=.env scripts/create-database.js",
+    "secrets": "node --env-file=.env scripts/secrets.js"
+  },
+  "dependencies": {
+    "big-integer": "1.6.52",
+    "teleproto": "1.229.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.3.6",
+    "@vitest/runner": "4.1.11",
+    "@vitest/snapshot": "4.1.11",
+    "vitest": "4.1.11",
+    "wrangler": "4.147.0",
+    "vite": "8.3.2"
+  }
+}

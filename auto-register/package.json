@@ -3,11 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/errors.js && node --check api/auth.js && node --check api/auth-runtime.js && node --check scripts/assign-account.js && node --check api/schema.js",
+    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/errors.js && node --check api/auth.js && node --check api/auth-runtime.js && node --check scripts/assign-account.js && node --check api/schema.js && node --check api/service.js && node --check scripts/export-d1.js",
     "create:bot": "node scripts/create-bot.js",
     "start:api": "node api/server.js",
     "test": "node --test test/*.test.js",
-    "assign:account": "node scripts/assign-account.js"
+    "assign:account": "node scripts/assign-account.js",
+    "export:d1": "node --env-file=.env scripts/export-d1.js"
   },
   "engines": {
     "node": ">=20"

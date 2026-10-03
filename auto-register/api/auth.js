@@ -45,7 +45,17 @@ return {1, value}
 const rateScript = `local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],ARGV[1]) end; return n`;
 const releaseScript = `if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) end; return 0`;
 
-export function createAuth({ redis, store, sendCode, secret, prefix = 'telegram-bot:', challengeTTL = CHALLENGE_TTL, sessionTTL = SESSION_TTL, now = Date.now }) {
+export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'telegram-bot:', challengeTTL = CHALLENGE_TTL, sessionTTL = SESSION_TTL, now = Date.now }) {
+  // Storage operations have explicit semantics; the Worker supplies a Durable
+  // Object implementation, while Docker continues to use atomic Redis scripts.
+  const state = cache || {
+    get: key => redis.get(key),
+    set: (key, value, options) => redis.set(key, value, options),
+    del: key => redis.del(key),
+    increment: (key, seconds) => redis.eval(rateScript, { keys: [key], arguments: [String(seconds)] }),
+    consume: (key, hash, purpose) => redis.eval(consumeChallengeScript, { keys: [key], arguments: [hash, purpose] }),
+    release: (key, lease) => redis.eval(releaseScript, { keys: [key], arguments: [lease] }),
+  };
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('AUTH_HMAC_SECRET 至少需要 32 字符');
   if (!Number.isInteger(challengeTTL) || challengeTTL < 60 || challengeTTL > 3600 || !Number.isInteger(sessionTTL) || sessionTTL < 60 || sessionTTL > 86400) throw new Error('验证码 TTL 需为 60–3600 秒，登录态 TTL 需为 60–86400 秒');
   const challengeKey = id => `${prefix}challenge:${id}`;
@@ -53,19 +63,19 @@ export function createAuth({ redis, store, sendCode, secret, prefix = 'telegram-
   const otpHash = (id, code) => createHmac('sha256', secret).update(`${id}:${code}`).digest('hex');
   const safeUser = user => ({ id: user.id, email: user.email });
   async function limit(kind, value, maximum, seconds = challengeTTL) {
-    const count = await redis.eval(rateScript, { keys: [`${prefix}rate:${kind}:${digest(value)}`], arguments: [String(seconds)] });
+    const count = await state.increment(`${prefix}rate:${kind}:${digest(value)}`, seconds);
     if (Number(count) > maximum) throw new Failure(429, '请求过于频繁，请稍后重试');
   }
   async function issue(purpose, email, values) {
     await limit('email', email, 5);
     const cooldown = `${prefix}mail-cooldown:${digest(email)}`;
-    if (!await redis.set(cooldown, '1', { NX: true, EX: 60 })) throw new Failure(429, '请等待 60 秒后再发送邮件验证码');
+    if (!await state.set(cooldown, '1', { NX: true, EX: 60 })) throw new Failure(429, '请等待 60 秒后再发送邮件验证码');
     const id = randomUUID(); const code = String(randomInt(100000, 1000000));
-    await redis.set(challengeKey(id), JSON.stringify({ purpose, email, ...values, code_hash: otpHash(id, code), attempts: 0 }), { EX: challengeTTL });
+    await state.set(challengeKey(id), JSON.stringify({ purpose, email, ...values, code_hash: otpHash(id, code), attempts: 0 }), { EX: challengeTTL });
     try { await sendCode(email, code, purpose); }
     catch {
-      await redis.del(challengeKey(id));
-      await redis.del(cooldown);
+      await state.del(challengeKey(id));
+      await state.del(cooldown);
       throw new Failure(503, '验证码邮件发送失败，请检查邮件服务后重试');
     }
     return { challenge_id: id, status: 'email_code_required', expires_in: challengeTTL };
@@ -73,21 +83,19 @@ export function createAuth({ redis, store, sendCode, secret, prefix = 'telegram-
   async function consume(body, purpose, ip) {
     await limit('verify-ip', ip, 60);
     if (typeof body.challenge_id !== 'string' || !/^[a-f0-9-]{36}$/.test(body.challenge_id) || !/^\d{6}$/.test(body.code || '')) throw new Failure(400, '需要 challenge_id 和 6 位邮件验证码');
-    const [success, raw] = await redis.eval(consumeChallengeScript, {
-      keys: [challengeKey(body.challenge_id)], arguments: [otpHash(body.challenge_id, String(body.code)), purpose],
-    });
+    const [success, raw] = await state.consume(challengeKey(body.challenge_id), otpHash(body.challenge_id, String(body.code)), purpose);
     if (Number(success) !== 1) throw new Failure(401, '验证码错误、已使用或已过期');
     return JSON.parse(raw);
   }
   async function session(user) {
     const token = randomBytes(32).toString('hex');
-    await redis.set(sessionKey(token), JSON.stringify({ user_id: user.id, expires_at: now() + sessionTTL * 1000 }), { EX: sessionTTL });
+    await state.set(sessionKey(token), JSON.stringify({ user_id: user.id, expires_at: now() + sessionTTL * 1000 }), { EX: sessionTTL });
     return { access_token: token, token_type: 'Bearer', expires_in: sessionTTL, user: safeUser(user) };
   }
   async function authenticate(header) {
     const token = typeof header === 'string' ? header.match(/^Bearer ([a-f0-9]{64})$/)?.[1] : null;
     if (!token) throw new Failure(401, '请先登录，提供有效 Bearer 登录凭据');
-    const raw = await redis.get(sessionKey(token));
+    const raw = await state.get(sessionKey(token));
     if (!raw) throw new Failure(401, '登录状态已失效，请重新登录');
     const data = JSON.parse(raw);
     if (data.expires_at <= now()) throw new Failure(401, '登录状态已过期，请重新登录');
@@ -103,8 +111,8 @@ export function createAuth({ redis, store, sendCode, secret, prefix = 'telegram-
     async lockPhone(phone) {
       const lockKey = `${prefix}telegram-lock:${digest(phone)}`;
       const lease = randomBytes(16).toString('hex');
-      if (!await redis.set(lockKey, lease, { NX: true, EX: 300 })) throw new Failure(409, '该 Telegram 账号正在操作');
-      return async () => redis.eval(releaseScript, { keys: [lockKey], arguments: [lease] });
+      if (!await state.set(lockKey, lease, { NX: true, EX: 300 })) throw new Failure(409, '该 Telegram 账号正在操作');
+      return async () => state.release(lockKey, lease);
     },
     async route(method, path, body, header, ip) {
       if (method === 'POST' && path === '/auth/register/start') {
@@ -142,7 +150,7 @@ export function createAuth({ redis, store, sendCode, secret, prefix = 'telegram-
       if (method === 'GET' && path === '/auth/me') return (await authenticate(header)).user;
       if (method === 'POST' && path === '/auth/logout') {
         const { token } = await authenticate(header);
-        await redis.del(sessionKey(token));
+        await state.del(sessionKey(token));
         return { ok: true };
       }
       throw new Failure(404, '接口不存在');
