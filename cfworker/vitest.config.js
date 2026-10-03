@@ -11,6 +11,7 @@ export default defineConfig({
     wrangler:{configPath:'./wrangler.jsonc'},
     miniflare:{bindings:{
       TEST_MIGRATIONS:await readD1Migrations('./migrations'),
+      AUTH_STATE_PREFIX:'telegram-bot:',
       TELEGRAM_PROBE:process.env.TELEGRAM_PROBE || '',PROBE_API_ID:process.env.TG_API_ID || '',PROBE_API_HASH:process.env.TG_API_HASH || '',
       AUTH_HMAC_SECRET:'local-test-only-secret-with-at-least-32-characters',
       MAIL_API_URL:'https://mailer.example.test/emails',MAIL_API_KEY:'local-test-key',MAIL_FROM:'test@example.test',

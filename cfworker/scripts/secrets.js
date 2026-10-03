@@ -4,7 +4,7 @@ const env=process.env;
 if(!env.AUTH_HMAC_SECRET || env.AUTH_HMAC_SECRET.length<32)throw new Error('需要至少 32 字符的 AUTH_HMAC_SECRET');
 const secrets={AUTH_HMAC_SECRET:env.AUTH_HMAC_SECRET};
 for(const key of ['MAIL_API_KEY','TG_API_HASH'])if(env[key])secrets[key]=env[key];
-const child=spawn(process.execPath,[fileURLToPath(new URL('../node_modules/wrangler/bin/wrangler.js',import.meta.url)),'secret','bulk','--config','wrangler.generated.json'],{
+const child=spawn(process.execPath,[fileURLToPath(new URL('../node_modules/wrangler/bin/wrangler.js',import.meta.url)),'secret','bulk',...process.argv.slice(2)],{
   cwd:fileURLToPath(new URL('../',import.meta.url)),env,stdio:['pipe','inherit','inherit'],
 });
 const completed=new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});

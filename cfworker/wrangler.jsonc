@@ -12,8 +12,6 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "telegram_cfworker",
-      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
   ],
@@ -38,18 +36,20 @@
       ]
     }
   ],
-  "vars": {
-    "AUTH_CHALLENGE_TTL_SECONDS": "600",
-    "AUTH_SESSION_TTL_SECONDS": "7200",
-    "AUTH_STATE_PREFIX": "telegram-bot:",
-    "PUBLIC_BASE_URL": "",
-    "MAIL_API_URL": "https://api.resend.com/emails",
-    "MAIL_FROM": ""
-  },
   "alias": {
     "teleproto": "./node_modules/teleproto",
     "teleproto/Password.js": "./node_modules/teleproto/Password.js",
     "teleproto/sessions/index.js": "./node_modules/teleproto/sessions/index.js",
     "big-integer": "./node_modules/big-integer"
-  }
+  },
+  "keep_vars": true,
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.sql"
+      ],
+      "fallthrough": true
+    }
+  ]
 }

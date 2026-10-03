@@ -3,6 +3,7 @@ import { digest } from '../../auto-register/api/auth.js';
 import { createConversion } from '../../auto-register/api/conversion.js';
 import { createStore } from './store.js';
 import { createAuthRuntime } from './auth-runtime.js';
+import { ensureSchema } from './schema.js';
 import { json,failure,bodyOf } from './http.js';
 export { AuthState } from './auth-state.js';
 export { TelegramAccount } from './telegram-account.js';
@@ -13,6 +14,7 @@ export default {
       const path = new URL(request.url).pathname;
       const method = request.method;
       if (path === '/health' && method === 'GET') return json({ok:true});
+      await ensureSchema(env.DB);
       const store = createStore(env.DB);
       const webhook = path.match(/^\/webhooks\/(\d+)$/);
       if (webhook) {

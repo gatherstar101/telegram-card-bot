@@ -10,13 +10,11 @@
     "build": "wrangler deploy --dry-run --outdir dist",
     "test": "vitest run",
     "db:local": "wrangler d1 migrations apply DB --local",
-    "configure": "node --env-file=.env scripts/configure.js",
-    "db:remote": "node --env-file=.env scripts/wrangler.js d1 migrations apply DB --remote",
-    "deploy": "node --env-file=.env scripts/wrangler.js deploy",
+    "db:remote": "wrangler d1 migrations apply",
+    "deploy": "wrangler deploy",
     "probe:telegram": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/probe-telegram.js",
-    "check": "node --check src/index.js && node --check src/auth-state.js && node --check src/auth-runtime.js && node --check src/store.js && node --check src/telegram-account.js && node --check src/telegram-socket.js && node --check scripts/configure.js && node --check scripts/probe-telegram.js && node --check scripts/wrangler.js && node --check scripts/create-database.js && node --check scripts/secrets.js",
-    "db:create": "node --env-file=.env scripts/create-database.js",
-    "secrets": "node --env-file=.env scripts/secrets.js"
+    "check": "node --check src/index.js && node --check src/auth-state.js && node --check src/auth-runtime.js && node --check src/store.js && node --check src/schema.js && node --check src/telegram-account.js && node --check src/telegram-socket.js && node --check scripts/probe-telegram.js && node --check scripts/secrets.js",
+    "secrets": "node --env-file-if-exists=.env scripts/secrets.js"
   },
   "dependencies": {
     "big-integer": "1.6.52",
