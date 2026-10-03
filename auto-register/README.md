@@ -10,6 +10,8 @@ Node.js Docker 服务通过已登录个人 Telegram 账号创建 Bot 和私有 C
 
 ## 部署和配置
 
+整套 Node.js Docker API 只构建本目录，包含平台鉴权、Telegram 登录、Bot、Landing Page 卡片、Webhook、Channel 和帖子发布。MySQL、Redis 连接现有服务；`card-bot/` 是可选的独立 Cloudflare Worker，使用本 API 回复卡片时无需部署它。
+
 以下命令在本目录执行，已有 `.env` 时保留原文件：
 
 ```bash

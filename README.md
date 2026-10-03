@@ -74,6 +74,10 @@ Channel 帖子同时提供落地页直接链接；加入频道不会自动启动
 
 ### Docker 部署
 
+整套 Docker API 只需构建 `auto-register/` 一个目录。这个镜像包含平台鉴权、Telegram 登录、Bot 创建、落地页卡片回复、Webhook、Channel 创建和帖子发布，MySQL、Redis 使用环境变量指定的现有服务。
+
+`card-bot/` 是可选的独立 Cloudflare Worker；使用 Docker API 回复卡片时无需构建或部署它。只有选择 Worker 作为某个 Bot 的卡片入口时，才按第二部分单独部署 `card-bot`。
+
 以下 API 命令均在 `auto-register/` 目录执行：
 
 ```bash
