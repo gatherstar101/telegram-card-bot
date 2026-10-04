@@ -13,7 +13,7 @@ it('creates all four business tables on the first protected request without buil
   expect(response.status).toBe(401);
   const rows=await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('user_info','tg_info','bot_info','channel_info') ORDER BY name").all();
   expect(rows.results.map(row=>row.name)).toEqual(['bot_info','channel_info','tg_info','user_info']);
-  expect((await env.DB.prepare('SELECT name FROM d1_migrations').all()).results).toEqual([{name:'0001_init.sql'},{name:'0002_security.sql'}]);
+  expect((await env.DB.prepare('SELECT name FROM d1_migrations').all()).results).toEqual([{name:'0001_init.sql'}]);
 });
 it('initializes concurrently and retains existing rows when a new isolate initializes again',async()=>{
   await Promise.all([ensureSchema(database()),ensureSchema(database())]);

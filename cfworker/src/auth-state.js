@@ -23,7 +23,6 @@ export class AuthState extends DurableObject {
     if (row) await this.ctx.storage.setAlarm(row.expires_at);
   }
   get() { return this.current()?.value ?? null; }
-  ttl() { const row=this.current();return row?Math.max(1,Math.ceil((row.expires_at-Date.now())/1000)):0; }
   async set(value,options) {
     const result = this.ctx.storage.transactionSync(() => {
       if (options.NX && this.current()) return null;
@@ -71,7 +70,6 @@ export function createAuthCache(env) {
   const object = key => env.AUTH_STATE.get(env.AUTH_STATE.idFromName(key));
   return {
     get: key => object(key).get(),
-    ttl: key => object(key).ttl(),
     set: (key,value,options) => object(key).set(value,options),
     del: key => object(key).del(),
     increment: (key,seconds) => object(key).increment(seconds),

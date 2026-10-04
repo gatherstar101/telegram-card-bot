@@ -38,12 +38,7 @@ export async function botApi(token, method, payload, fetcher = fetch) {
       body: JSON.stringify(payload), signal: AbortSignal.timeout(15000),
     });
     const result = await response.json();
-    if (!response.ok || !result.ok) {
-      const error=new Failure(502,`Telegram ${method} 失败（${result.error_code || response.status}）`);
-      error.telegram_code=result.error_code||response.status;
-      error.retry_after=Number(result.parameters?.retry_after)||null;
-      throw error;
-    }
+    if (!response.ok || !result.ok) throw new Failure(502, `Telegram ${method} 失败（${result.error_code || response.status}）`);
     return result.result;
   } catch (error) {
     if (error instanceof Failure) throw error;
@@ -51,14 +46,14 @@ export async function botApi(token, method, payload, fetcher = fetch) {
   }
 }
 function publicLanding(config) {
-  const { webhook_secret, token, telegram_bot_id, ...result } = config;
+  const { webhook_secret, token, ...result } = config;
   return result;
 }
 function publicChannel(channel) {
   const { access_hash, posts, ...result } = channel;
   return { ...result, bot_url: `https://t.me/${channel.bot_username}?start=channel` };
 }
-export function createConversion({ store, connected, save, env = process.env, fetcher = fetch, checkpoint = async () => {} }) {
+export function createConversion({ store, connected, save, env = process.env, fetcher = fetch }) {
   return {
     async handleWebhook(botId, secret, update) {
       const config = await store.webhookBot(botId);
@@ -105,7 +100,7 @@ export function createConversion({ store, connected, save, env = process.env, fe
         }
         throw new Failure(404, '接口不存在');
       }
-      const channelRoute = suffix.match(/^channels(?:\/([A-Za-z0-9_-]+)(?:\/(posts|reconcile))?)?$/);
+      const channelRoute = suffix.match(/^channels(?:\/([A-Za-z0-9_-]+)(?:\/(posts))?)?$/);
       if (!channelRoute) return undefined;
       const [, key, posts] = channelRoute;
       if (method === 'GET' && key && !posts) {
@@ -114,23 +109,6 @@ export function createConversion({ store, connected, save, env = process.env, fe
         return publicChannel(channel);
       }
       if (state.status !== 'authorized') throw new Failure(401, '请先完成 Telegram 登录');
-      if(method==='POST' && key && posts==='reconcile' && store.channelFailed) {
-        const channel=await store.getChannel(id,requestKey(key));
-        if(!channel)throw new Failure(404,'Channel 不存在');
-        if(!/^\d{1,20}$/.test(body.channel_id||'')||! /^-?\d{1,20}$/.test(body.access_hash||''))throw new Failure(400,'需要字符串 channel_id 和 access_hash');
-        await connected(state,async client=>{
-          const result=await client.invoke(new Api.channels.GetChannels({id:[new Api.InputChannel({channelId:bigInt(body.channel_id),accessHash:bigInt(body.access_hash)})]}));
-          const remote=result.chats?.find(c=>c.id.toString()===body.channel_id);
-          if(!remote?.creator||remote.title!==channel.title||remote.megagroup)throw new Failure(403,'该账号必须是相同标题的广播 Channel 创建者');
-          if(channel.channel_id&&channel.channel_id!==body.channel_id)throw new Failure(409,'不能替换已记录的 Channel');
-          await store.saveChannel(id,key,{channel_id:body.channel_id,access_hash:body.access_hash});
-          const peer=new Api.InputPeerChannel({channelId:bigInt(body.channel_id),accessHash:bigInt(body.access_hash)});
-          const invite=await client.invoke(new Api.messages.ExportChatInvite({peer,title:'Landing flow'}));
-          if(!invite.link)throw new Failure(502,'Telegram 未返回邀请链接');
-          await store.channelReady(id,key,invite.link);
-        });
-        return publicChannel(await store.getChannel(id,key));
-      }
       if (method === 'POST' && !key) {
         const request_key = requestKey(body.request_key);
         const title = text(body.title, 'title', 128);
@@ -143,20 +121,12 @@ export function createConversion({ store, connected, save, env = process.env, fe
         if (existing && (existing.title !== title || existing.about !== about || existing.bot_username.toLowerCase() !== botUsername.toLowerCase() || existing.customer_id !== config.customer_id)) throw new Failure(409, 'request_key 已用于其他 Channel 配置');
         if (existing?.status === 'ready') return publicChannel(existing);
         if (existing?.status === 'creating') throw new Failure(409, '上次创建结果不确定，请检查 Telegram，使用新 key 可能产生重复 Channel');
-
+        if (!existing) await store.reserveChannel(id, { request_key, title, about, bot_username: config.bot_username, customer_id: config.customer_id });
         await connected(state, async client => {
           if (!await client.checkAuthorization()) throw new Failure(401, 'Telegram 会话已失效');
           let channel = existing;
           if (!channel) {
-            await store.reserveChannel(id,{request_key,title,about,bot_username:config.bot_username,customer_id:config.customer_id});
-            await checkpoint('channel_create',{request_key});
-            let created;
-            try { created=await client.createChannel({title,about,megagroup:false}); }
-            catch(error) {
-              // RPC rejection is a definite failure; network errors remain uncertain.
-              if(error.errorMessage && store.channelFailed)await store.channelFailed(id,request_key);
-              throw error;
-            }
+            const created = await client.createChannel({ title, about, megagroup: false });
             channel = { channel_id: created.id.toString(), access_hash: created.accessHash.toString() };
             state.pending_channel = { request_key, ...channel };
             await save(id, state);
@@ -171,7 +141,7 @@ export function createConversion({ store, connected, save, env = process.env, fe
         });
         return publicChannel(await store.getChannel(id, request_key));
       }
-      if (method === 'POST' && key && posts==='posts') {
+      if (method === 'POST' && key && posts) {
         const channel = await store.getChannel(id, requestKey(key));
         if (!channel || channel.status !== 'ready') throw new Failure(400, '请先完成 Channel 创建');
         const config = await store.getLanding(id, channel.bot_username);
@@ -190,7 +160,6 @@ export function createConversion({ store, connected, save, env = process.env, fe
         await connected(state, async client => {
           if (!await client.checkAuthorization()) throw new Failure(401, 'Telegram 会话已失效');
           const peer = new Api.InputPeerChannel({ channelId: bigInt(channel.channel_id), accessHash: bigInt(channel.access_hash) });
-          await checkpoint('post_send',{request_key});
           const result = await client.invoke(new Api.messages.SendMessage({
             peer, message: `${post.message_text}\n\n打开助手：${post.bot_url}\n查看活动：${post.landing_url}`, randomId: bigInt(post.random_id), noWebpage: true,
           }));

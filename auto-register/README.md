@@ -1,6 +1,4 @@
-# Legacy：Node.js Bot 自动化创建与客户转化 API
-
-本目录保留原 Node.js Docker 服务。`feature-cfworker` 的当前主服务见 [Cloudflare 版本](../README.md)，其使用 D1、Durable Objects、加密凭据和持久化任务；本文描述 MySQL/Redis 与同步业务接口的使用方式，配置和接口能力以本目录文档为准。
+# Bot 自动化创建与客户转化 API
 
 Node.js Docker 服务通过已登录个人 Telegram 账号创建 Bot 和私有 Channel，并将不同客户的 Landing Page、卡片及帖子配置保存到 MySQL。每个用户先完成邮箱、密码及邮件验证码认证，再管理自己的 Telegram 会话、Bot 和 Channel。不同用户的账号路径检查归属。
 

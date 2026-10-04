@@ -3,9 +3,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Api } from 'teleproto';
 import { computeCheck } from 'teleproto/Password.js';
 import { Failure } from './errors.js';
-import { createConversion,botApi } from './conversion.js';
+import { createConversion } from './conversion.js';
 
-export function createService({ store, auth, connected, env = process.env, checkpoint = async () => {}, fetcher = fetch }) {
+export function createService({ store, auth, connected, env = process.env }) {
 const busy = new Set();
 function requireValue(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new Failure(400, `缺少 ${name}`);
@@ -29,7 +29,7 @@ async function exchange(client, peer, text) {
   }
   throw new Failure(504, 'BotFather 回复超时；请先检查对话，再重试创建');
 }
-const conversion = createConversion({ store, connected, save, env, checkpoint, fetcher });
+const conversion = createConversion({ store, connected, save, env });
 async function route(method, path, body, user) {
   if (method === 'GET' && path === '/v1/accounts') return { accounts: await store.accountsForUser(user.id) };
   if (method === 'POST' && path === '/v1/login/start') {
@@ -65,11 +65,10 @@ async function route(method, path, body, user) {
   if (initial.user_id !== user.id) throw new Failure(404, '账号不存在');
   if (busy.has(initial.phone)) throw new Failure(409, '该账号正在操作，请稍后重试');
   busy.add(initial.phone);
-  let release,state,snapshot;
+  let release;
   try {
     release = await auth.lockPhone(initial.phone);
-    state = await load(id);
-    snapshot = JSON.stringify(state);
+    const state = await load(id);
     if (state.pending_bot) {
       const recovered = await store.get(id, state.pending_bot.username);
       if (!recovered) await store.save(id, state.pending_bot);
@@ -85,19 +84,7 @@ async function route(method, path, body, user) {
     const converted = await conversion.route(method, suffix, id, state, body);
     if (converted !== undefined) return converted;
     if (method === 'GET' && !action) return { account_id: id, status: state.status };
-    if (method === 'POST' && suffix === 'logout' && store.updateToken) {
-      if(state.status==='revoked')return {account_id:id,status:'revoked'};
-      try { await connected(state,client=>client.invoke(new Api.auth.LogOut())); }
-      catch(error) {
-        if(!['AUTH_KEY_UNREGISTERED','SESSION_REVOKED','SESSION_EXPIRED'].includes(error.errorMessage))throw error;
-      }
-      state.session='';state.status='revoked';
-      delete state.phone_code_hash;delete state.expires_at;delete state.pending_bot;delete state.pending_channel;
-      await save(id,state);
-      return {account_id:id,status:'revoked'};
-    }
     if (method === 'POST' && suffix === 'verify') {
-      if(state.status==='revoked')throw new Failure(401,'Telegram 登录已撤销');
       if (state.status === 'authorized') return { account_id: id, status: state.status };
       if (Date.now() > state.expires_at) throw new Failure(410, '登录流程过期，请重新发送验证码');
       await connected(state, async client => {
@@ -125,37 +112,6 @@ async function route(method, path, body, user) {
       await save(id, state);
       return { account_id: id, status: state.status };
     }
-    if (action==='bots' && method==='PUT' && suffix===`bots/${username}/token` && store.updateToken) {
-      const bot=await store.get(id,username);
-      if(!bot)throw new Failure(404,'Bot 不存在');
-      const token=requireValue(body.token,'token');
-      if(!/^\d+:[A-Za-z0-9_-]{30,}$/.test(token)||token.split(':')[0]!==bot.token.split(':')[0])throw new Failure(400,'Token 必须属于同一个 Bot');
-      const me=await botApi(token,'getMe',{},fetcher);
-      if(!me.is_bot||me.username?.toLowerCase()!==username.toLowerCase()||String(me.id)!==token.split(':')[0])throw new Failure(400,'Token 与 Bot 不匹配');
-      await store.updateToken(id,username,token);
-      return {ok:true,username};
-    }
-    if(action==='bots' && method==='POST' && suffix===`bots/${username}/reconcile` && store.updateToken) {
-      if(state.status!=='authorized')throw new Failure(401,'请先完成 Telegram 登录');
-      if(!/^[a-z][a-z0-9_]{4,31}$/i.test(username)||!/bot$/i.test(username))throw new Failure(400,'Bot 用户名无效');
-      const existing=await store.get(id,username);
-      if(existing)return existing;
-      let bot;
-      await connected(state,async client=>{
-        if(!await client.checkAuthorization())throw new Failure(401,'Telegram 会话已失效');
-        const peer=await client.getEntity('BotFather');
-        await exchange(client,peer,'/cancel');
-        await exchange(client,peer,'/token');
-        const reply=await exchange(client,peer,`@${username}`);
-        const token=reply.match(/\b\d+:[A-Za-z0-9_-]{30,}\b/)?.[0];
-        if(!token)throw new Failure(409,'BotFather 未确认该 Bot 的归属或 Token，请人工核对');
-        const me=await botApi(token,'getMe',{},fetcher);
-        if(!me.is_bot||me.username?.toLowerCase()!==username.toLowerCase())throw new Failure(409,'BotFather 返回的 Bot 不匹配');
-        bot={username:me.username,name:me.first_name,token,url:`https://t.me/${me.username}`};
-        state.pending_bot=bot;await save(id,state);await store.save(id,bot);delete state.pending_bot;await save(id,state);
-      });
-      return bot;
-    }
     if (action === 'bots' && method === 'GET' && username && suffix.split('/').length === 2) {
       const bot = await store.get(id, username);
       if (!bot) throw new Failure(404, '未找到本服务保存的 Bot');
@@ -175,18 +131,9 @@ async function route(method, path, body, user) {
         await exchange(client, peer, '/cancel');
         if (!/name/i.test(await exchange(client, peer, '/newbot'))) throw new Failure(422, 'BotFather 未接受创建，请检查对话或账号限制');
         if (!/username/i.test(await exchange(client, peer, name))) throw new Failure(422, 'BotFather 未接受名称，请检查对话');
-        await checkpoint('bot_create',{username:user});
         const reply = await exchange(client, peer, user);
         const token = reply.match(/\b\d+:[A-Za-z0-9_-]{30,}\b/)?.[0];
-        if (!token) {
-          const error=new Failure(422,'BotFather 未返回 Token，请核对用户名或创建限制');
-          error.remote_rejected=/already taken|username is invalid|username must end/i.test(reply);
-          throw error;
-        }
-        if(store.updateToken) {
-          const me=await botApi(token,'getMe',{},fetcher);
-          if(!me.is_bot||me.username?.toLowerCase()!==user.toLowerCase()||String(me.id)!==token.split(':')[0])throw new Failure(409,'BotFather 返回的 Bot 与请求不一致，需要核对');
-        }
+        if (!token) throw new Failure(422, 'BotFather 未返回 Token，请检查用户名占用或创建限制');
         bot = { username: user, name, token, url: `https://t.me/${user}` };
         // Persist the remote result before inserting the bot record.
         state.pending_bot = bot;
@@ -198,10 +145,7 @@ async function route(method, path, body, user) {
       return bot;
     }
     throw new Failure(404, '接口不存在');
-  } finally {
-    try { if(state&&JSON.stringify(state)!==snapshot)await save(id,state); }
-    finally {busy.delete(initial.phone);await release?.();}
-  }
+  } finally { busy.delete(initial.phone); await release?.(); }
 }
 return { route, handleWebhook: conversion.handleWebhook };
 }

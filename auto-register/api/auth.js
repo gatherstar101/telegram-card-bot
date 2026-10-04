@@ -45,12 +45,11 @@ return {1, value}
 const rateScript = `local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],ARGV[1]) end; return n`;
 const releaseScript = `if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) end; return 0`;
 
-export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'telegram-bot:', challengeTTL = CHALLENGE_TTL, sessionTTL = SESSION_TTL, now = Date.now, lockTTL = 300 }) {
+export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'telegram-bot:', challengeTTL = CHALLENGE_TTL, sessionTTL = SESSION_TTL, now = Date.now }) {
   // Storage operations have explicit semantics; the Worker supplies a Durable
   // Object implementation, while Docker continues to use atomic Redis scripts.
   const state = cache || {
     get: key => redis.get(key),
-    ttl: key => redis.ttl ? redis.ttl(key) : 60,
     set: (key, value, options) => redis.set(key, value, options),
     del: key => redis.del(key),
     increment: (key, seconds) => redis.eval(rateScript, { keys: [key], arguments: [String(seconds)] }),
@@ -65,25 +64,18 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
   const safeUser = user => ({ id: user.id, email: user.email });
   async function limit(kind, value, maximum, seconds = challengeTTL) {
     const count = await state.increment(`${prefix}rate:${kind}:${digest(value)}`, seconds);
-    if (Number(count)>maximum) {
-      const error=new Failure(429,'请求过于频繁，请稍后重试');
-      error.retry_after=state.ttl?Math.max(1,await state.ttl(`${prefix}rate:${kind}:${digest(value)}`)):seconds;
-      throw error;
-    }
+    if (Number(count) > maximum) throw new Failure(429, '请求过于频繁，请稍后重试');
   }
   async function issue(purpose, email, values) {
     await limit('email', email, 5);
     const cooldown = `${prefix}mail-cooldown:${digest(email)}`;
-    if (!await state.set(cooldown, '1', { NX: true, EX: 60 })) {
-      const error=new Failure(429,'请等待 60 秒后再发送邮件验证码');
-      error.retry_after=state.ttl?Math.max(1,await state.ttl(cooldown)):60;
-      throw error;
-    }
+    if (!await state.set(cooldown, '1', { NX: true, EX: 60 })) throw new Failure(429, '请等待 60 秒后再发送邮件验证码');
     const id = randomUUID(); const code = String(randomInt(100000, 1000000));
     await state.set(challengeKey(id), JSON.stringify({ purpose, email, ...values, code_hash: otpHash(id, code), attempts: 0 }), { EX: challengeTTL });
     try { await sendCode(email, code, purpose); }
     catch {
       await state.del(challengeKey(id));
+      await state.del(cooldown);
       throw new Failure(503, '验证码邮件发送失败，请检查邮件服务后重试');
     }
     return { challenge_id: id, status: 'email_code_required', expires_in: challengeTTL };
@@ -97,7 +89,7 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
   }
   async function session(user) {
     const token = randomBytes(32).toString('hex');
-    await state.set(sessionKey(token), JSON.stringify({ user_id: user.id, auth_version: user.auth_version || 0, expires_at: now() + sessionTTL * 1000 }), { EX: sessionTTL });
+    await state.set(sessionKey(token), JSON.stringify({ user_id: user.id, expires_at: now() + sessionTTL * 1000 }), { EX: sessionTTL });
     return { access_token: token, token_type: 'Bearer', expires_in: sessionTTL, user: safeUser(user) };
   }
   async function authenticate(header) {
@@ -108,8 +100,8 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
     const data = JSON.parse(raw);
     if (data.expires_at <= now()) throw new Failure(401, '登录状态已过期，请重新登录');
     const user = await store.userById(data.user_id);
-    if (!user || user.disabled || (data.auth_version || 0) !== (user.auth_version || 0)) throw new Failure(401, '登录状态已撤销');
-    return { user: { ...safeUser(user),auth_version:user.auth_version || 0 }, token };
+    if (!user) throw new Failure(401, '用户不存在');
+    return { user: safeUser(user), token };
   }
   return {
     authenticate,
@@ -119,7 +111,7 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
     async lockPhone(phone) {
       const lockKey = `${prefix}telegram-lock:${digest(phone)}`;
       const lease = randomBytes(16).toString('hex');
-      if (!await state.set(lockKey, lease, { NX: true, EX: lockTTL })) throw new Failure(409, '该 Telegram 账号正在操作');
+      if (!await state.set(lockKey, lease, { NX: true, EX: 300 })) throw new Failure(409, '该 Telegram 账号正在操作');
       return async () => state.release(lockKey, lease);
     },
     async route(method, path, body, header, ip) {
@@ -146,30 +138,16 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
         // Do comparable password work even when the email does not exist.
         const fallback = '00000000000000000000000000000000:' + '00'.repeat(64);
         const matches = await verifyPassword(body.password, user?.password_hash || fallback);
-        if (!user || user.disabled || !matches) throw new Failure(401, '邮箱或密码错误');
-        return issue('login', email, { user_id: user.id, auth_version: user.auth_version || 0 });
+        if (!user || !matches) throw new Failure(401, '邮箱或密码错误');
+        return issue('login', email, { user_id: user.id });
       }
       if (method === 'POST' && path === '/auth/login/verify') {
         const challenge = await consume(body, 'login', ip);
         const user = await store.userById(challenge.user_id);
-        if (!user || user.disabled || (challenge.auth_version || 0)!==(user.auth_version || 0)) throw new Failure(401, '用户不存在或登录验证已撤销');
+        if (!user) throw new Failure(401, '用户不存在');
         return session(user);
       }
-      if (method === 'POST' && path === '/auth/logout-all' && store.revokeSessions) {
-        const {user}=await authenticate(header);
-        await store.revokeSessions(user.id);
-        return {ok:true};
-      }
-      if (method === 'POST' && path === '/auth/password' && store.changePassword) {
-        const {user}=await authenticate(header);
-        const current=await store.userById(user.id);
-        passwordValue(body.current_password);passwordValue(body.new_password);
-        await limit('password-change',user.id,5);
-        if(!await verifyPassword(body.current_password,current.password_hash))throw new Failure(401,'当前密码错误');
-        await store.changePassword(user.id,await hashPassword(body.new_password));
-        return {ok:true,status:'login_required'};
-      }
-      if (method === 'GET' && path === '/auth/me') return safeUser((await authenticate(header)).user);
+      if (method === 'GET' && path === '/auth/me') return (await authenticate(header)).user;
       if (method === 'POST' && path === '/auth/logout') {
         const { token } = await authenticate(header);
         await state.del(sessionKey(token));

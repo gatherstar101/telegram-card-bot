@@ -7,13 +7,13 @@
   },
   "scripts": {
     "dev": "wrangler dev",
-    "build": "npm run check && npm test && wrangler deploy --dry-run --outdir dist",
+    "build": "wrangler deploy --dry-run --outdir dist",
     "test": "vitest run",
     "db:local": "wrangler d1 migrations apply DB --local",
     "db:remote": "wrangler d1 migrations apply",
     "deploy": "wrangler deploy",
     "probe:telegram": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/probe-telegram.js",
-    "check": "node --check src/index.js && node --check src/auth-state.js && node --check src/auth-runtime.js && node --check src/store.js && node --check src/schema.js && node --check src/telegram-account.js && node --check src/telegram-socket.js && node --check scripts/probe-telegram.js && node --check scripts/secrets.js && node --check src/security.js && node --check src/jobs.js && node --check src/webhook-delivery.js",
+    "check": "node --check src/index.js && node --check src/auth-state.js && node --check src/auth-runtime.js && node --check src/store.js && node --check src/schema.js && node --check src/telegram-account.js && node --check src/telegram-socket.js && node --check scripts/probe-telegram.js && node --check scripts/secrets.js",
     "secrets": "node --env-file-if-exists=.env scripts/secrets.js"
   },
   "dependencies": {

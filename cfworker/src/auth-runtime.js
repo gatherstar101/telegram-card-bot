@@ -2,8 +2,8 @@ import { createAuth } from '../../auto-register/api/auth.js';
 import { createAuthCache } from './auth-state.js';
 
 export function createAuthRuntime(store,env) {
-  const auth=createAuth({
-    lockTTL:600,store,cache:createAuthCache(env),secret:env.AUTH_HMAC_SECRET,
+  return createAuth({
+    store,cache:createAuthCache(env),secret:env.AUTH_HMAC_SECRET,
     prefix:env.AUTH_STATE_PREFIX || 'telegram-bot:',
     challengeTTL:Number(env.AUTH_CHALLENGE_TTL_SECONDS || 600),
     sessionTTL:Number(env.AUTH_SESSION_TTL_SECONDS || 7200),
@@ -20,5 +20,4 @@ export function createAuthRuntime(store,env) {
       await response.body?.cancel();
     },
   });
-  return auth;
 }
