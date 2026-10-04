@@ -15,3 +15,5 @@ auto-register/scripts/.bot-token.env
 *.session-shm
 __pycache__/
 data/
+# Local artifacts left after checking out the Cloudflare feature branch.
+/cfworker/

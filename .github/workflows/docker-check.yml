@@ -1,0 +1,70 @@
+name: Docker API checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ['auto-register/**', 'card-bot/**', '.github/workflows/docker-check.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: integration-test-password
+          MYSQL_DATABASE: telegram_ci
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_USER: root
+      MYSQL_PASSWORD: integration-test-password
+      MYSQL_DATABASE: telegram_ci
+      REDIS_HOST: 127.0.0.1
+      REDIS_KEY_PREFIX: 'telegram-ci:'
+      AUTH_HMAC_SECRET: integration-hmac-secret-longer-than-32-characters
+      CREDENTIAL_KEY_ID: v1
+      CREDENTIAL_KEYS: '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
+      ADMIN_API_KEY: integration-admin-secret-longer-than-32-characters
+      PORT: 3100
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: auto-register/package-lock.json
+      - run: npm ci
+        working-directory: auto-register
+      - run: npm run check
+      - run: npm test
+        working-directory: auto-register
+      - name: MySQL and Redis security and upgrade tests
+        run: node --test test/security.test.js test/upgrade.test.js
+        working-directory: auto-register
+        env:
+          SECURITY_INTEGRATION: '1'
+      - name: HTTP authentication with local SMTP receiver
+        working-directory: auto-register
+        run: |
+          node api/server.js > /tmp/telegram-api-test.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid"; wait "$api_pid" || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3100/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:3100/health
+          INTEGRATION_TEST=1 node --test test/integration.test.js
+      - name: Build Docker image
+        run: docker build -t telegram-api:ci auto-register

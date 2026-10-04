@@ -104,6 +104,7 @@ test('real MySQL/Redis authentication, persistence and HTTP ownership', { skip: 
     assert.equal((await request('/auth/me',session.access_token)).status,401);
     console.log('Verified real tables, local SMTP, HTTP OTP verification, TTLs, replay, persistence and cross-user access');
   } finally {
+    await db.execute('DELETE FROM channel_posts WHERE account_id=?',[account]);
     for (const table of ['channel_info','bot_info','tg_info'])await db.execute(`DELETE FROM ${table} WHERE account_id=?`,[account]);
     for(const user of users)await db.execute('DELETE FROM user_info WHERE id=?',[user.id]);
     const keys=[...tokens.map(token=>prefix+'session:'+digest(token)),...challenges.map(id=>prefix+'challenge:'+id)];

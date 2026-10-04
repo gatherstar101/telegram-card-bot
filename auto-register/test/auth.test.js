@@ -98,7 +98,8 @@ test('failed email delivery removes challenge; Redis failure does not authentica
  const failed=harness({mailError:true});
  await assert.rejects(failed.auth.route('POST','/auth/register/start',{email:'user@example.test',password:'long-test-password'},null,'ip'),error=>error.status===503);
  assert.equal(failed.users.size,0);
- assert.equal([...failed.records.keys()].some(key=>key.includes('challenge:')||key.includes('mail-cooldown:')),false);
+ assert.equal([...failed.records.keys()].some(key=>key.includes('challenge:')),false);
+ assert.equal([...failed.records.keys()].some(key=>key.includes('mail-cooldown:')),true);
  const h=harness();const {result}=await h.register();
  h.redis.get=async()=>{throw new Error('Redis unavailable');};
  await assert.rejects(h.auth.authenticate('Bearer '+result.access_token),/Redis unavailable/);

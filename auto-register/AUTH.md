@@ -20,7 +20,7 @@
 | SMTP_REQUIRE_TLS | true | 要求 STARTTLS；仅本地测试邮件服务器可设 false |
 | SMTP_USER / SMTP_PASSWORD | 空 | 服务器要求鉴权时同时填写；可使用邮箱服务的应用密码 |
 
-服务启动时必须连接 MySQL 和 Redis。未配置 SMTP 时可以启动，但发送验证码会返回 503，无法注册或登录。生产环境应通过 HTTPS 访问 API。服务按 TCP 来源 IP 限流，不信任客户端提交的转发头；反向代理后的用户会共用该来源 IP 限额。
+服务启动时必须连接 MySQL 和 Redis。未配置 SMTP 时可以启动，但发送验证码会返回 503，无法注册或登录。生产环境应通过 HTTPS 访问 API。默认按 TCP 来源 IP 限流；可信反向代理后可按实际层数设置 TRUST_PROXY_HOPS，且必须禁止绕过代理。完整新增运行配置见主 README。
 
 ## 注册与登录接口
 
@@ -30,6 +30,8 @@
 | POST | /auth/register/verify | challenge_id、code | 创建 user_info，返回 access_token、user、expires_in |
 | POST | /auth/login/start | email、password | 校验密码，发登录邮件，返回 challenge_id |
 | POST | /auth/login/verify | challenge_id、code | 返回新的 access_token |
+| POST | /auth/logout-all | 无 | Bearer 鉴权后撤销全部平台会话与旧登录验证 |
+| POST | /auth/password | current_password、new_password | 改密并撤销全部平台会话 |
 | GET | /auth/me | 无 | Bearer 鉴权后返回用户 id、email |
 | POST | /auth/logout | 无 | Bearer 鉴权后撤销当前登录令牌 |
 | GET | /v1/accounts | 无 | Bearer 鉴权后列出本人保存的 Telegram account_id 和状态 |
@@ -54,7 +56,7 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 后续登录将 start/verify 路径替换为 `/auth/login/start` 和 `/auth/login/verify`。每次验证成功生成独立的 2 小时令牌；访问不会续期，无刷新令牌接口。Redis 仅保存令牌 SHA-256 摘要对应的用户 ID 和到期时间。退出仅撤销本次平台令牌，不终止 Telegram 会话，不删除 Bot。
 
-邮件同一邮箱最多每 60 秒发送一次，每个验证码有效期窗口最多 5 次；鉴权入口同一来源 IP 最多 20 次，验证入口 60 次；同一邮箱密码检查最多 10 次。超过限制返回 429。Redis 不可用时不会放行受保护接口。
+邮件同一邮箱最多每 60 秒发送一次，每个验证码有效期窗口最多 5 次；鉴权入口同一来源 IP 最多 20 次，验证入口 60 次；同一邮箱密码检查最多 10 次。获取验证码三个 start 接口还共享每 IP 默认 1 QPS，Telegram 同手机号跨用户/IP 有 60 秒冷却，发送失败也保留；超限返回 429、Retry-After 和 retry_after。Redis 不可用时不会放行受保护接口。
 
 ## 四张业务表
 
@@ -67,7 +69,7 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 关系为 `user_info.id → tg_info.user_id`，以及 `tg_info.account_id → bot_info.account_id / channel_info.account_id`；服务检查这些归属关系，数据库目前通过索引关联，没有外键级联删除。不同用户访问他人的 account_id、Bot 或 Channel 返回 404。customer_id 仅是业务标识，不能代替平台身份。旧共享 API_KEY 不再用于业务鉴权。
 
-MySQL 自动创建环境变量 `MYSQL_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [sql/init.sql](sql/init.sql)。Telegram session 和 Bot Token 为可复用凭据，当前按原始值存库，应限制数据库访问并保护备份。Telegram session 不受平台 2 小时 TTL 影响；终止它需在 Telegram 客户端设备列表撤销会话。
+MySQL 自动创建环境变量 `MYSQL_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [sql/init.sql](sql/init.sql)。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
 
 ## 旧 JSON 会话迁移
 
