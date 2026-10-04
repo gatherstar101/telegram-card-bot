@@ -1,9 +1,6 @@
 name: Docker API checks
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths: ['auto-register/**', 'card-bot/**', '.github/workflows/docker-check.yml']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

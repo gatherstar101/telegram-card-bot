@@ -13,10 +13,11 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "127.0.0.1:${API_PORT:-3100}:3000"
+      - "127.0.0.1:${API_PORT:-3100}:3100"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      PORT: 3100
       AUTH_HMAC_SECRET: ${AUTH_HMAC_SECRET:?Set AUTH_HMAC_SECRET in .env}
       AUTH_CHALLENGE_TTL_SECONDS: ${AUTH_CHALLENGE_TTL_SECONDS:-600}
       AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-7200}

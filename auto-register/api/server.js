@@ -32,7 +32,7 @@ server.requestTimeout=15000;server.headersTimeout=10000;server.keepAliveTimeout=
 const interval=integer(env,'QUEUE_POLL_INTERVAL_MS',1000,100,10000);
 const stopJobs=background(()=>jobs.runOnce(),{interval,onError:()=>audit('job_worker_error',{kind:'storage_or_runtime'})});
 const stopDeliveries=background(()=>deliveries.runOnce(),{interval,onError:()=>audit('webhook_worker_error',{kind:'storage_or_runtime'})});
-server.listen(integer(env,'PORT',3000,1,65535),'0.0.0.0',()=>audit('service_started'));
+server.listen(integer(env,'PORT',3100,1,65535),'0.0.0.0',()=>audit('service_started'));
 let stopping=false;
 async function stop(){if(stopping)return;stopping=true;audit('service_stopping');try{await Promise.all([new Promise(resolve=>server.close(resolve)),stopJobs(),stopDeliveries()]);await auth.close();await store.close();audit('service_stopped');}catch{audit('service_shutdown_error');process.exitCode=1;}}
 process.on('SIGTERM',stop);process.on('SIGINT',stop);

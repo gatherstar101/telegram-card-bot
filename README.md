@@ -118,7 +118,7 @@ card-bot/                   Legacy 独立单 Bot 卡片 Worker
 | `SMTP_REQUIRE_TLS` | true；仅受控本地测试可用 false |
 | `SMTP_USER` / `SMTP_PASSWORD` | 依邮件服务配置；设置 user 时必须提供 password |
 | `API_PORT` | 3100，Compose 宿主机映射端口，默认仅监听 127.0.0.1 |
-| `PORT` | 3000，容器 HTTP 端口；Compose 固定映射至此端口 |
+| `PORT` | 3100，Node.js 默认监听端口；Compose 固定容器内部为 3100 |
 | `PUBLIC_BASE_URL` | 注册 Webhook 时需要；本 API 的公网 HTTPS 源地址，不含路径 |
 | `TG_API_ID` / `TG_API_HASH` / `TG_PHONE` | 可选默认 App ID/hash/国际区号手机号，请求优先 |
 | `TG_BOT_NAME` / `TG_BOT_USERNAME` | 可选 Bot 名称/用户名默认值 |
@@ -133,7 +133,7 @@ node -e "console.log(JSON.stringify({v1:require('node:crypto').randomBytes(32).t
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-把 JSON 密钥环按一行放入 .env，例如 `CREDENTIAL_KEYS='{"v1":"YOUR_BASE64_KEY"}'`。妥善保管密钥与数据库备份，丢失旧密钥无法读取对应凭据。
+把 JSON 密钥环按一行放入 .env，例如 `CREDENTIAL_KEYS={"v1":"YOUR_BASE64_KEY"}`。妥善保管密钥与数据库备份，丢失旧密钥无法读取对应凭据。
 
 SMTP 暂不配置仍可启动并访问 `/health`，真实发码及 `/ready` 返回 503。PUBLIC_BASE_URL 在登录和创建资源阶段可以留空；真实 Telegram 回调需要 HTTPS 公网地址。它是 API 地址，客户页面地址另通过 landing API 设置。
 
@@ -225,6 +225,8 @@ docker compose ps
 curl http://127.0.0.1:3100/health
 curl http://127.0.0.1:3100/ready
 ```
+
+默认宿主机与容器内部均使用 3100，Compose 映射为 `127.0.0.1:3100:3100`。API_PORT 和 PORT 都无需手动配置；API_PORT 仅修改 Compose 的宿主机端口。直接运行镜像时使用 `docker run -p 127.0.0.1:3100:3100 --env-file .env YOUR_IMAGE`。若显式覆盖 PORT，docker run 的映射目标端口也需同步调整。
 
 启动按 DB_TYPE 选择驱动、按 DB_DATABASE 自动建库并初始化八张表和索引，然后连接 Redis、启动 HTTP 和后台队列。设置 DB_AUTO_CREATE_DATABASE=false 时只连接已有库并初始化表/索引。MySQL 还会扩容已知旧凭据列为 TEXT/MEDIUMTEXT，此步骤不加密旧数据，管理员需完成分页迁移。PostgreSQL 使用独立建表 SQL 和 JSONB 字段，队列在两种数据库中都使用事务与 FOR UPDATE SKIP LOCKED。初始化应串行发布。
 
@@ -627,7 +629,7 @@ SECURITY_INTEGRATION=1 node --env-file=.env --test --test-concurrency=1 \
 
 本地依赖地址与 Docker 地址可能不同，按测试所在网络调整 DB_HOST/REDIS_HOST，REDIS_URL 若已填写仍优先。集成测试应使用独立测试库与 Redis prefix；原鉴权集成需要已运行的同配置 API，安全集成自己启动临时 HTTP 服务。SMTP 测试使用本地接收器，不需要实际外部邮箱。
 
-真实 MySQL/PostgreSQL、Redis 与 HTTP 验证覆盖加密读写、旧凭据迁移、会话撤销、QPS/60 秒冷却、任务持久化/领取/中断恢复/核对、Webhook 去重/429/未知结果重试。Telegram 副作用使用模拟执行器，真实用户登录、BotFather 创建、Channel/帖子、公网 Webhook 和外部 SMTP 投递仍需单独验收。CI 分别运行 mysql/postgresql 两个后端矩阵，MySQL 旧列升级测试仅在 MySQL 执行。构建与单元测试通过不等于已达到线上可用性 SLA。
+真实 MySQL/PostgreSQL、Redis 与 HTTP 验证覆盖加密读写、旧凭据迁移、会话撤销、QPS/60 秒冷却、任务持久化/领取/中断恢复/核对、Webhook 去重/429/未知结果重试。Telegram 副作用使用模拟执行器，真实用户登录、BotFather 创建、Channel/帖子、公网 Webhook 和外部 SMTP 投递仍需单独验收。GitHub Actions 仅通过 workflow_dispatch 手动运行，不再由 push 或 pull_request 自动触发；在 Actions → Docker API checks → Run workflow 中选择 main。工作流分别验证 mysql/postgresql 两个后端，MySQL 旧列升级测试仅在 MySQL 执行。构建与单元测试通过不等于已达到线上可用性 SLA。
 
 <a id="legacy-card-bot"></a>
 

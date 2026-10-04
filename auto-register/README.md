@@ -30,7 +30,7 @@ curl http://127.0.0.1:3100/health
 curl http://127.0.0.1:3100/ready
 ```
 
-Compose 仅创建 API 容器，连接已有关系数据库/Redis。默认宿主机端口 3100、仅监听 127.0.0.1，公网入口使用 HTTPS 反向代理。容器使用非 root、只读根文件系统、移除 capabilities 和 6 分钟退出宽限。health 检查 HTTP，可在 SMTP 空缺时为 200；ready 检查必要配置与依赖，SMTP 未配置为 503，不实际探测邮件投递。
+Compose 仅创建 API 容器，连接已有关系数据库/Redis。默认宿主机与容器内部端口均为 3100，映射为 `127.0.0.1:3100:3100`；API_PORT 和 PORT 无需手动配置。直接运行镜像可用 `docker run -p 127.0.0.1:3100:3100 --env-file .env YOUR_IMAGE`。公网入口使用 HTTPS 反向代理。容器使用非 root、只读根文件系统、移除 capabilities 和 6 分钟退出宽限。health 检查 HTTP，可在 SMTP 空缺时为 200；ready 检查必要配置与依赖，SMTP 未配置为 503，不实际探测邮件投递。
 
 修改 .env 后执行 `docker compose up -d telegram-api` 重建容器；restart 不加载新变量。更新代码先 build 再 up，保留关系数据库/Redis、密钥与 Redis prefix。多副本需负载均衡和独立端口配置，不能直接扩展当前固定端口的 Compose。
 
