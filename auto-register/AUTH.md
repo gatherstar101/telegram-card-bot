@@ -20,7 +20,7 @@
 | SMTP_REQUIRE_TLS | true | 要求 STARTTLS；仅本地测试邮件服务器可设 false |
 | SMTP_USER / SMTP_PASSWORD | 空 | 服务器要求鉴权时同时填写；可使用邮箱服务的应用密码 |
 
-服务启动时必须连接 MySQL 和 Redis。未配置 SMTP 时可以启动，但发送验证码会返回 503，无法注册或登录。生产环境应通过 HTTPS 访问 API。默认按 TCP 来源 IP 限流；可信反向代理后可按实际层数设置 TRUST_PROXY_HOPS，且必须禁止绕过代理。完整新增运行配置见主 README。
+服务启动时必须连接关系数据库和 Redis。未配置 SMTP 时可以启动，但发送验证码会返回 503，无法注册或登录。生产环境应通过 HTTPS 访问 API。默认按 TCP 来源 IP 限流；可信反向代理后可按实际层数设置 TRUST_PROXY_HOPS，且必须禁止绕过代理。完整新增运行配置见主 README。
 
 ## 注册与登录接口
 
@@ -36,7 +36,7 @@
 | POST | /auth/logout | 无 | Bearer 鉴权后撤销当前登录令牌 |
 | GET | /v1/accounts | 无 | Bearer 鉴权后列出本人保存的 Telegram account_id 和状态 |
 
-邮箱会转换为小写。密码为 12–128 字符，使用随机盐和 scrypt 哈希写入 MySQL，保留密码中的空格。六位邮件验证码不通过 API 返回，也不写入日志；同一 challenge 最多错误 5 次、成功后立即销毁，并且不能将注册验证码用于登录。
+邮箱会转换为小写。密码为 12–128 字符，使用随机盐和 scrypt 哈希写入关系数据库，保留密码中的空格。六位邮件验证码不通过 API 返回，也不写入日志；同一 challenge 最多错误 5 次、成功后立即销毁，并且不能将注册验证码用于登录。
 
 ```bash
 curl -X POST http://127.0.0.1:3100/auth/register/start \
@@ -69,7 +69,7 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 关系为 `user_info.id → tg_info.user_id`，以及 `tg_info.account_id → bot_info.account_id / channel_info.account_id`；服务检查这些归属关系，数据库目前通过索引关联，没有外键级联删除。不同用户访问他人的 account_id、Bot 或 Channel 返回 404。customer_id 仅是业务标识，不能代替平台身份。旧共享 API_KEY 不再用于业务鉴权。
 
-MySQL 自动创建环境变量 `MYSQL_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [sql/init.sql](sql/init.sql)。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
+服务按 DB_TYPE 选择 MySQL 或 PostgreSQL，自动创建环境变量 `DB_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [MySQL SQL](sql/init.sql) 和 [PostgreSQL SQL](sql/postgresql/init.sql)。DB_AUTO_CREATE_DATABASE=false 可连接已有库，仍初始化表/索引。数据库配置只读取 DB_*。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
 
 ## 旧 JSON 会话迁移
 
@@ -82,4 +82,4 @@ docker compose exec \
   telegram-api npm run assign:account
 ```
 
-`DATA_DIR` 默认本地 `./data`，Compose 为 `/data`；只用于读取旧 `<account_id>.json`。脚本将该会话导入 tg_info，保留 account_id，不删除原文件，也不允许转移已属于他人的账号。新 API 登录直接存 MySQL，不再创建 JSON 会话文件。旧 Bot/客户/Channel 表的数据需要由管理员确认归属后迁移，不能仅凭知道旧 account_id 通过 HTTP 认领。
+`DATA_DIR` 默认本地 `./data`，Compose 为 `/data`；只用于读取旧 `<account_id>.json`。脚本将该会话导入 tg_info，保留 account_id，不删除原文件，也不允许转移已属于他人的账号。新 API 登录直接存关系数据库，不再创建 JSON 会话文件。旧 Bot/客户/Channel 表的数据需要由管理员确认归属后迁移，不能仅凭知道旧 account_id 通过 HTTP 认领。

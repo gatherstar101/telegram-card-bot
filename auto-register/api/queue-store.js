@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-// Fixed table names only. MySQL transactions arbitrate claims between replicas.
+// Fixed table names only. SQL transactions arbitrate claims between replicas.
 export function queueStore(store,table,running) {
   if(!['api_jobs','webhook_deliveries'].includes(table))throw new Error('Invalid queue');
   const where=table==='api_jobs'?'id=?':'bot_id=? AND update_id=?';

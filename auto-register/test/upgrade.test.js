@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import mysql from 'mysql2/promise';
 import {randomBytes,randomUUID} from 'node:crypto';
 import {createStore} from '../api/store.js';
+import {databaseConfig} from '../api/database.js';
 
-test('legacy MySQL widths/JSON upgrade and versioned re-encryption preserve data',{skip:process.env.SECURITY_INTEGRATION!=='1'},async()=>{
- const database='tg_upgrade_'+randomUUID().replaceAll('-','');const v1=randomBytes(32).toString('base64');const env={...process.env,MYSQL_DATABASE:database,CREDENTIAL_KEY_ID:'v1',CREDENTIAL_KEYS:JSON.stringify({v1})};let store;
- const admin=await mysql.createConnection({host:env.MYSQL_HOST,port:Number(env.MYSQL_PORT||3306),user:env.MYSQL_USER,password:env.MYSQL_PASSWORD});
+test('legacy MySQL widths/JSON upgrade and versioned re-encryption preserve data',{skip:process.env.SECURITY_INTEGRATION!=='1'||process.env.DB_TYPE==='postgresql'},async()=>{
+ const database='tg_upgrade_'+randomUUID().replaceAll('-','');const v1=randomBytes(32).toString('base64');const env={...process.env,DB_DATABASE:database,CREDENTIAL_KEY_ID:'v1',CREDENTIAL_KEYS:JSON.stringify({v1})};let store;
+ const admin=await mysql.createConnection(databaseConfig(env).options);
  try{
   store=await createStore(env);await store.close();store=null;
   await admin.query(`ALTER TABLE ${database}.tg_info MODIFY api_hash CHAR(32) NOT NULL, MODIFY phone VARCHAR(32) NOT NULL, MODIFY phone_code_hash VARCHAR(256) NULL, MODIFY pending_bot JSON NULL, MODIFY pending_channel JSON NULL`);

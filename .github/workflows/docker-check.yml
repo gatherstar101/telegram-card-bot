@@ -9,6 +9,10 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [mysql, postgresql]
     services:
       mysql:
         image: mysql:8.0
@@ -19,6 +23,15 @@ jobs:
         options: >-
           --health-cmd="mysqladmin ping -h localhost"
           --health-interval=10s --health-timeout=5s --health-retries=10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: integration-test-password
+          POSTGRES_DB: telegram_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=10
       redis:
         image: redis:7-alpine
         ports: ['6379:6379']
@@ -26,10 +39,12 @@ jobs:
           --health-cmd="redis-cli ping"
           --health-interval=5s --health-timeout=5s --health-retries=10
     env:
-      MYSQL_HOST: 127.0.0.1
-      MYSQL_USER: root
-      MYSQL_PASSWORD: integration-test-password
-      MYSQL_DATABASE: telegram_ci
+      DB_TYPE: ${{ matrix.database }}
+      DB_PORT: ${{ matrix.database == 'mysql' && '3306' || '5432' }}
+      DB_HOST: 127.0.0.1
+      DB_USER: ${{ matrix.database == 'mysql' && 'root' || 'postgres' }}
+      DB_PASSWORD: integration-test-password
+      DB_DATABASE: telegram_ci
       REDIS_HOST: 127.0.0.1
       REDIS_KEY_PREFIX: 'telegram-ci:'
       AUTH_HMAC_SECRET: integration-hmac-secret-longer-than-32-characters
@@ -49,8 +64,8 @@ jobs:
       - run: npm run check
       - run: npm test
         working-directory: auto-register
-      - name: MySQL and Redis security and upgrade tests
-        run: node --test test/security.test.js test/upgrade.test.js
+      - name: SQL and Redis security and upgrade tests
+        run: node --test --test-concurrency=1 test/database.test.js test/security.test.js test/upgrade.test.js
         working-directory: auto-register
         env:
           SECURITY_INTEGRATION: '1'

@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
-import mysql from 'mysql2/promise';
 import { createClient } from 'redis';
 import { createStore } from '../api/store.js';
 import { digest } from '../api/auth.js';
@@ -37,14 +36,14 @@ async function testMailer(mail) {
   return {port:server.address().port,close:async()=>{for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}};
 }
 
-// Opt-in: use a running API and the same MySQL/Redis environment. No Telegram
+// Opt-in: use a running API and the same database/Redis environment. No Telegram
 // operations or external emails are sent; SMTP is captured by a local server.
-test('real MySQL/Redis authentication, persistence and HTTP ownership', { skip: process.env.INTEGRATION_TEST !== '1' }, async () => {
+test('real SQL/Redis authentication, persistence and HTTP ownership', { skip: process.env.INTEGRATION_TEST !== '1' }, async () => {
   const store = await createStore();
   const redis = createClient({ ...(process.env.REDIS_URL ? {url:process.env.REDIS_URL} : {socket:{host:process.env.REDIS_HOST,port:Number(process.env.REDIS_PORT||6379),reconnectStrategy:false},username:process.env.REDIS_USER||undefined,password:process.env.REDIS_PASSWORD||undefined,database:Number(process.env.REDIS_DB||0)}) });
   redis.on('error', () => {});
   await redis.connect();
-  const db = await mysql.createConnection({host:process.env.MYSQL_HOST,port:Number(process.env.MYSQL_PORT||3306),user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,database:process.env.MYSQL_DATABASE});
+  const db = store.pool;
   const prefix = process.env.REDIS_KEY_PREFIX || 'telegram-bot:';
   const mail=[]; const users=[]; const account=randomUUID(); const phone='+447700'+String(Math.floor(Math.random()*1000000)).padStart(6,'0');
   const stamp=randomUUID();const ip='integration-'+stamp;const emails=[`integration-${stamp}@example.test`,`integration-other-${stamp}@example.test`];
@@ -106,10 +105,10 @@ test('real MySQL/Redis authentication, persistence and HTTP ownership', { skip: 
   } finally {
     await db.execute('DELETE FROM channel_posts WHERE account_id=?',[account]);
     for (const table of ['channel_info','bot_info','tg_info'])await db.execute(`DELETE FROM ${table} WHERE account_id=?`,[account]);
-    for(const user of users)await db.execute('DELETE FROM user_info WHERE id=?',[user.id]);
+    for(const user of users){await db.execute('DELETE FROM user_security WHERE user_id=?',[user.id]);await db.execute('DELETE FROM user_info WHERE id=?',[user.id]);}
     const keys=[...tokens.map(token=>prefix+'session:'+digest(token)),...challenges.map(id=>prefix+'challenge:'+id)];
     for(const email of emails)keys.push(prefix+'mail-cooldown:'+digest(email),prefix+'rate:email:'+digest(email),prefix+'rate:password-email:'+digest(email));
     keys.push(prefix+'rate:auth-ip:'+digest(ip),prefix+'rate:verify-ip:'+digest(ip),prefix+'telegram-lock:'+digest(phone));
-    await redis.del(keys);await db.end();await auth.close();await smtp.close();await redis.quit();await store.close();
+    await redis.del(keys);await auth.close();await smtp.close();await redis.quit();await store.close();
   }
 });

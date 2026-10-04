@@ -134,7 +134,7 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
         const challenge = await consume(body, 'register', ip);
         const user = { id: randomUUID(), email: challenge.email, password_hash: challenge.password_hash };
         try { await store.createUser(user); }
-        catch (error) { if (error.code === 'ER_DUP_ENTRY') throw new Failure(409, '该邮箱已注册，请登录'); throw error; }
+        catch (error) { if (['ER_DUP_ENTRY','23505'].includes(error.code)) throw new Failure(409, '该邮箱已注册，请登录'); throw error; }
         return session(user);
       }
       if (method === 'POST' && path === '/auth/login/start') {

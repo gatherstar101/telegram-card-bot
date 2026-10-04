@@ -26,7 +26,7 @@ test('webhook configuration without a secret fails closed',async()=>{
  await assert.rejects(delivery.receive('1','',{update_id:1}),e=>e.status===503);
 });
 
-test('real MySQL/Redis security, OTP throttling, durable job recovery and webhook dedup',{skip:process.env.SECURITY_INTEGRATION!=='1'},async()=>{
+test('real SQL/Redis security, OTP throttling, durable job recovery and webhook dedup',{skip:process.env.SECURITY_INTEGRATION!=='1'},async()=>{
  const env={...process.env,TRUST_PROXY_HOPS:'1',API_USER_PER_MINUTE:'1000'};
  const store=await createStore(env);const auth=await createAuthRuntime(store,env);const id=randomUUID();const account=randomUUID();const prefix=env.REDIS_KEY_PREFIX||'telegram-bot:';const token=randomBytes(32).toString('hex');const phone='+447700'+String(Math.floor(Math.random()*1e6)).padStart(6,'0');
  await store.createUser({id,email:`security-${id}@example.test`,password_hash:await hashPassword('security-long-password')});
@@ -75,7 +75,7 @@ test('real MySQL/Redis security, OTP throttling, durable job recovery and webhoo
   const currentUser=await store.userById(id);const updated=await localService.route('PUT',`/v1/accounts/${account}/bots/${bot.username}/token`,{token:botId+':'+ 'n'.repeat(35)},currentUser);assert.equal(updated.ok,true);assert.equal(updated.token,undefined);assert.equal((await store.get(account,bot.username)).token,botId+':'+ 'n'.repeat(35));
   const logout=await localService.route('POST',`/v1/accounts/${account}/logout`,{},currentUser);assert.equal(logout.status,'revoked');assert.equal((await store.getAccount(account)).session,'');
   await store.pool.execute("UPDATE tg_info SET api_hash='legacy-hash' WHERE account_id=?",[account]);await assert.rejects(store.getAccount(account),e=>e.status===503);await store.rewrap('tg_info','',100);assert.equal((await store.getAccount(account)).api_hash,'legacy-hash');
-  console.log('Docker security integration: real MySQL/Redis and HTTP, simulated Telegram side effects passed');
+  console.log('Docker security integration: real SQL/Redis and HTTP, simulated Telegram side effects passed');
  }finally{
   await new Promise(resolve=>server.close(resolve));
   for(const table of ['api_jobs','channel_posts','channel_info','bot_info','tg_info'])await store.pool.execute(`DELETE FROM ${table} WHERE user_id=?` .replace('WHERE user_id=?',table==='channel_posts'?'WHERE account_id=?':'WHERE user_id=?'),[table==='channel_posts'?account:id]);

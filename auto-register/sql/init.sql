@@ -1,5 +1,5 @@
--- MySQL 8.0+. The service uses MYSQL_DATABASE and initializes these tables automatically.
--- For manual execution, select the target database first (mysql -D YOUR_DATABASE).
+-- MySQL 8.0+. Select the DB_DATABASE target before running.
+-- Database creation is managed by the service or administrator.
 
 CREATE TABLE IF NOT EXISTS user_info (
     id CHAR(36) NOT NULL PRIMARY KEY,

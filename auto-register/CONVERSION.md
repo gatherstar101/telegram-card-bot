@@ -19,7 +19,7 @@ Channel → Bot 链接 → 用户按 Start → 客户卡片 → Landing Page
 
 ## 部署和配置
 
-在 `auto-register/` 目录配置 `.env`，沿用 README 的 鉴权、MySQL、Redis、SMTP 和 Telegram 参数，增加：
+在 `auto-register/` 目录配置 `.env`，沿用 README 的 鉴权、关系数据库、Redis、SMTP 和 Telegram 参数，增加：
 
 ```ini
 PUBLIC_BASE_URL=https://bots.example.com
@@ -49,7 +49,7 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots \
   -d '{"name":"客户 A 助手","username":"customer_a_unique_bot"}'
 ```
 
-返回 HTTP 202 的 job_id，GET /v1/accounts/:id/jobs/:job_id 成功后从 result 读取 username、name、token、url，凭据加密保存到 MySQL。用户名需要全局唯一；账号需要仍有效的 Telegram 授权。同一账号和用户名已有本服务记录时返回保存结果，不创建第二个 Bot。
+返回 HTTP 202 的 job_id，GET /v1/accounts/:id/jobs/:job_id 成功后从 result 读取 username、name、token、url，凭据加密保存到关系数据库。用户名需要全局唯一；账号需要仍有效的 Telegram 授权。同一账号和用户名已有本服务记录时返回保存结果，不创建第二个 Bot。
 
 ## 2. 配置客户 Landing Page 和卡片
 
@@ -88,7 +88,7 @@ curl -X POST http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique
 {"username":"customer_a_unique_bot","webhook_url":"https://bots.example.com/webhooks/123456","status":"registered"}
 ```
 
-用户私聊发送 `/start` 时，API 根据 Bot ID 从 MySQL 读取客户配置并发送图片或文字、网址按钮。这里由 Docker API 直接处理卡片，无需为每个客户部署 Cloudflare Worker。一个 Bot 只能设置一个 Webhook；注册到 Docker API 会替换该 Bot 之前的 Worker Webhook。独立 `card-bot` 仍可用于其他 Bot。
+用户私聊发送 `/start` 时，API 根据 Bot ID 从关系数据库读取客户配置并发送图片或文字、网址按钮。这里由 Docker API 直接处理卡片，无需为每个客户部署 Cloudflare Worker。一个 Bot 只能设置一个 Webhook；注册到 Docker API 会替换该 Bot 之前的 Worker Webhook。独立 `card-bot` 仍可用于其他 Bot。
 
 ## 4. 创建客户 Channel
 
@@ -137,4 +137,4 @@ curl http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/channels/customer_a_channel_00
 
 这里不会自动删除远程已创建资源或回滚已经发布的内容。步骤拆分后可以先查询状态再继续，避免重新执行成功步骤。账户限流、创建数量限制和账号权限仍由 Telegram 决定。项目提供模拟 Telegram 的流程测试；未经指定真实 Bot/Channel 信息，不自动在账号中创建或发布测试资源。
 
-本地已验证真实 MySQL 新表初始化、客户配置保存和更新、Webhook 鉴权、Channel 查询及已发送帖子结果读取；模拟测试覆盖完整流程和重试。真实 Channel 创建、帖子发布和公网 Webhook 收发尚未执行，需要提供目标 Bot/Channel 参数及 PUBLIC_BASE_URL。
+本地已验证真实关系数据库新表初始化、客户配置保存和更新、Webhook 鉴权、Channel 查询及已发送帖子结果读取；模拟测试覆盖完整流程和重试。真实 Channel 创建、帖子发布和公网 Webhook 收发尚未执行，需要提供目标 Bot/Channel 参数及 PUBLIC_BASE_URL。
