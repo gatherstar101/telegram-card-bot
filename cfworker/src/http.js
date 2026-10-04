@@ -3,7 +3,9 @@ import { Failure } from '../../auto-register/api/errors.js';
 export const json = (value,status=200) => Response.json(value,{status,headers:{'Cache-Control':'no-store'}});
 export function failure(error) {
   const status = error.status || (error.errorMessage?.startsWith('FLOOD_WAIT') ? 429 : error.errorMessage ? 422 : 500);
-  return json({error:error.status ? error.message : error.errorMessage || '服务内部错误'},status);
+  const response=json({error:error.status?error.message:error.errorMessage||'服务内部错误',...(error.retry_after?{retry_after:error.retry_after}:{})},status);
+  if(status===429&&error.retry_after)response.headers.set('Retry-After',String(Math.max(1,Math.ceil(error.retry_after))));
+  return response;
 }
 export async function bodyOf(request,maximum=16384) {
   if (!request.body) return {};

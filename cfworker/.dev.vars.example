@@ -1,3 +1,7 @@
+# Local runtime configuration. Generate real keys before use; do not deploy placeholders.
+CREDENTIAL_KEY_ID=v1
+CREDENTIAL_KEYS='{"v1":"REPLACE_WITH_32_RANDOM_BYTES_IN_BASE64"}'
+ADMIN_API_KEY=
 AUTH_HMAC_SECRET=replace_with_random_secret_at_least_32_characters
 AUTH_CHALLENGE_TTL_SECONDS=600
 AUTH_SESSION_TTL_SECONDS=7200

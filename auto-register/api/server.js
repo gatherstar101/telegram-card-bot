@@ -39,7 +39,8 @@ const server = http.createServer(async (req, res) => {
     respond(200, await service.route(req.method, path, body, identity.user));
   } catch (e) {
     const status = e.status || (e.errorMessage?.startsWith('FLOOD_WAIT') ? 429 : e.errorMessage ? 422 : 500);
-    respond(status, { error: e.status ? e.message : e.errorMessage || '服务内部错误' });
+    if(status===429&&e.retry_after)res.setHeader('Retry-After',String(e.retry_after));
+    respond(status, { ...(e.retry_after?{retry_after:e.retry_after}:{}),error: e.status ? e.message : e.errorMessage || '服务内部错误' });
   }
 });
 server.requestTimeout = 300000;

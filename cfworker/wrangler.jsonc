@@ -24,6 +24,10 @@
       {
         "name": "TELEGRAM_ACCOUNTS",
         "class_name": "TelegramAccount"
+      },
+      {
+        "name": "WEBHOOK_DELIVERIES",
+        "class_name": "WebhookDelivery"
       }
     ]
   },
@@ -33,6 +37,12 @@
       "new_sqlite_classes": [
         "AuthState",
         "TelegramAccount"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "WebhookDelivery"
       ]
     }
   ],
@@ -51,5 +61,13 @@
       ],
       "fallthrough": true
     }
-  ]
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+      "head_sampling_rate": 1
+    }
+  }
 }

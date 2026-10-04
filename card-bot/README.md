@@ -1,10 +1,10 @@
 # Legacy：Telegram Card Bot
 
-本目录保留原有独立 Cloudflare Worker 的使用方式。当前主服务已转为 [auto-register Docker API](../README.md#build-and-verify)，新服务的客户卡片直接由该 API 返回。本文供已有 Worker 部署或单独使用卡片入口时参考。
+本目录保留原有独立 Cloudflare Worker 的使用方式。`feature-cfworker` 的当前主服务是 [Cloudflare Bot 自动化 API](../README.md#build-and-verify)，已包含客户卡片和 Webhook 投递。本文供已有独立 Worker 部署或单独使用卡片入口时参考；原 Node.js Docker API 见 [auto-register 文档](../auto-register/README.md)。
 
 Cloudflare Workers 使用已有 Bot Token，在私聊收到 `/start` 后发送固定图片、文案和网址按钮。无图片时发送文字和按钮。每个部署使用一组 Worker 环境变量，卡片服务无需 MySQL 或个人账号会话。适合已创建 Bot 的独立卡片接入。
 
-如果已使用主服务 Docker API 的客户配置和 Webhook，可以由 Docker 直接发送卡片；Cloudflare Worker 是另一种部署选项。同一个 Bot 注册到 Worker 后会替换 Docker Webhook，反之亦然。
+如果已使用 Cloudflare 主服务或原 Docker API 的客户配置和 Webhook，卡片由对应 API 发送，无需部署本目录。同一个 Bot 注册到独立 Worker 后会替换原 API 的 Webhook，反之亦然。
 
 ### 准备
 
@@ -127,4 +127,4 @@ bash scripts/register-webhook.sh
 
 ## 当前主服务
 
-邮箱注册、Telegram 登录、Bot 自动创建、客户卡片和 Channel 管理见 [项目主 README](../README.md)。Worker 不读取主服务的 MySQL 或 Redis，同一个 Bot 应只选择一个 Webhook 接收入口。
+邮箱注册、Telegram 登录、Bot 自动创建、客户卡片和 Channel 管理见 [项目主 README](../README.md)。独立卡片 Worker 不读取主服务的 D1、Durable Objects 或原 MySQL/Redis，同一个 Bot 应只选择一个 Webhook 接收入口。
