@@ -7,7 +7,7 @@ import { trackedLink } from './tracking.js';
 
 export class Deliveries {
   constructor(store,auth,env,send=botApi){this.store=store;this.auth=auth;this.env=env;this.send=send;this.crypt=credentials(env);this.queue=queueStore(store,'webhook_deliveries','sending');this.lastCleanup=0;}
-  view(row){if(!row)throw new Failure(404,'投递不存在');return {bot_id:row.bot_id,update_id:row.update_id,status:row.status,attempts:row.attempts,updated_at:Number(row.updated_at)};}
+  view(row){if(!row)throw new Failure(404,'投递不存在');return {bot_id:row.bot_id,update_id:row.update_id,status:row.status,attempts:row.attempts,message_id:row.remote_message_id||null,updated_at:Number(row.updated_at)};}
   async receive(botId,secret,update){
     const config=await this.store.webhookBot(botId);if(!config)throw new Failure(404,'Bot 未配置');
     if(typeof config.webhook_secret!=='string'||config.webhook_secret.length<32)throw new Failure(503,'Webhook 密钥未配置');
@@ -50,11 +50,43 @@ export class Deliveries {
       if(!['failed','uncertain'].includes(current?.status))throw new Failure(409,'当前状态不能重试');if(current.status==='uncertain'&&allowDuplicate!==true)throw new Failure(409,'结果未知，重试需明确 allow_duplicate=true');
       const n=await this.queue.one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE bot_id=? AND status IN ('queued','sending')",[row.bot_id]);if(Number(n.n)>=integer(this.env,'WEBHOOK_QUEUE_LIMIT',500,1,10000))throw new Failure(503,'投递队列已满');
       const payload=JSON.parse(this.crypt.open(current.payload,`delivery:${row.bot_id}:${row.update_id}`));
+      delete payload.remote_sent_at;
       if(this.store.assertBusiness){const config=await this.store.webhookBot(row.bot_id);if(!config)throw new Failure(404,'Bot 不存在');payload.business_epoch=await this.store.assertBusiness(config.user_id);const policy=await this.store.botPolicy(row.bot_id);if(policy&&policy.status!=='active')throw new Failure(409,'项目未启用','PROJECT_INACTIVE');if(policy)payload.project_epoch=policy.epoch;}
-      await this.queue.update(current,{payload:this.crypt.seal(JSON.stringify(payload),`delivery:${row.bot_id}:${row.update_id}`),status:'queued',attempts:0,lease:null,lease_until:0,next_at:Date.now(),updated_at:Date.now()});return this.view({...current,status:'queued',attempts:0});
+      await this.queue.update(current,{payload:this.crypt.seal(JSON.stringify(payload),`delivery:${row.bot_id}:${row.update_id}`),status:'queued',attempts:0,remote_message_id:null,lease:null,lease_until:0,next_at:Date.now(),updated_at:Date.now()});return this.view({...current,status:'queued',attempts:0,remote_message_id:null});
     },30);if(locked.busy)throw new Failure(409,'投递正在处理');return locked.value;
   }
-  async finish(row,status,nextAt=Date.now()){await this.queue.update(row,{status,attempts:row.attempts,lease:null,lease_until:0,next_at:nextAt,updated_at:Date.now()},true);audit('webhook_delivery_finished',{bot_id:row.bot_id,update_id:row.update_id,status});}
+  sentEvent(row,payload,userId,messageId,occurredAt=payload.remote_sent_at??Date.now()){
+    return {user_id:userId,project_id:payload.project_id,bot_id:row.bot_id,environment:payload.environment,type:'card_sent',event_key:`sent:${row.bot_id}:${row.update_id}`,source:payload.source,occurred_at:occurredAt,data:{telegram_user_id:payload.telegram_user_id,version:payload.version,message_id:messageId}};
+  }
+  async reconcile(row){
+    const config=await this.store.webhookBot(row.bot_id);if(!config)throw new Failure(404,'Bot 不存在');
+    const locked=await withLease(this.auth.cache,`${this.env.REDIS_KEY_PREFIX||'telegram-bot:'}delivery-enqueue:${row.bot_id}`,()=>this.store.transaction(async connection=>{
+      await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[config.user_id]);
+      if(this.store.businessState)await this.store.businessState(config.user_id,connection);
+      const [rows]=await connection.execute('SELECT * FROM webhook_deliveries WHERE bot_id=? AND update_id=? FOR UPDATE',[row.bot_id,row.update_id]);
+      const current=rows[0];if(!current)throw new Failure(404,'投递不存在');if(current.status==='sent')return this.view(current);
+      if(current.status!=='uncertain'||!current.remote_message_id)throw new Failure(409,'无已保存的 Telegram 成功回执，无法自动核对','DELIVERY_RECEIPT_REQUIRED','review');
+      const payload=JSON.parse(this.crypt.open(current.payload,`delivery:${row.bot_id}:${row.update_id}`));
+      if(this.store.event)await this.store.event(this.sentEvent(current,payload,config.user_id,current.remote_message_id,payload.remote_sent_at??Number(current.updated_at)),connection);
+      const now=Date.now();const changed=await this.queue.update(current,{status:'sent',updated_at:now},false,connection);
+      if(changed!==1)throw new Failure(409,'投递状态已变更');
+      return this.view({...current,status:'sent',updated_at:now});
+    }),30);
+    if(locked.busy)throw new Failure(409,'投递正在处理');
+    audit('webhook_delivery_reconciled',{bot_id:row.bot_id,update_id:row.update_id,message_id:locked.value.message_id});return locked.value;
+  }
+  async finish(row,status,nextAt=Date.now(),receipt={}){
+    const write=async connection=>{
+      // Lock and check the current lease before recording either result or evidence.
+      const [rows]=await connection.execute('SELECT lease,lease_until,status FROM webhook_deliveries WHERE bot_id=? AND update_id=? FOR UPDATE',[row.bot_id,row.update_id]);
+      if(!rows.length||rows[0].lease!==row.lease||Number(rows[0].lease_until)<=Date.now()||rows[0].status!=='sending')throw new Failure(409,'投递任务租约已失效','DELIVERY_LEASE_EXPIRED');
+      const changed=await this.queue.update(row,{status,attempts:row.attempts,...(receipt.message_id!==undefined?{remote_message_id:receipt.message_id}:{}),...(receipt.payload?{payload:this.crypt.seal(JSON.stringify(receipt.payload),`delivery:${row.bot_id}:${row.update_id}`)}:{}),lease:null,lease_until:0,next_at:nextAt,updated_at:Date.now()},true,connection);
+      if(changed!==1)throw new Failure(409,'投递任务租约已失效','DELIVERY_LEASE_EXPIRED');
+      if(receipt.event&&this.store.event)await this.store.event(receipt.event,connection);
+    };
+    await this.store.transaction(write);
+    audit('webhook_delivery_finished',{bot_id:row.bot_id,update_id:row.update_id,status,message_id:receipt.message_id??null});
+  }
   async runOnce(){
     if(Date.now()-this.lastCleanup>3600000){await this.queue.cleanup(integer(this.env,'WEBHOOK_RETENTION_SECONDS',604800,172800,2592000));this.lastCleanup=Date.now();}
     const row=await this.queue.claim(60);if(!row)return;
@@ -62,6 +94,7 @@ export class Deliveries {
       if(row.previous_status==='sending'){await this.finish(row,'uncertain');return;}
       const config=await this.store.webhookBot(row.bot_id);if(!config){await this.finish(row,'failed');return;}
       const payload=JSON.parse(this.crypt.open(row.payload,`delivery:${row.bot_id}:${row.update_id}`));row.attempts++;
+      let remoteAccepted=false,messageId;
       try{
         const businessEpoch=payload.business_epoch??0;
         if(this.store.assertBusiness)await this.store.assertBusiness(config.user_id,businessEpoch);
@@ -69,12 +102,17 @@ export class Deliveries {
         if(policy&&(policy.status!=='active'||policy.environment==='production'&&!policy.published_version||policy.environment==='test'&&!policy.config.test_user_ids.includes(payload.telegram_user_id)))throw new Failure(403,'资源业务已停止','PROJECT_INACTIVE');
         const landing=payload.project_id?(await this.store.projectConfig(payload.project_id,payload.version)).landing:config;
         const link=this.trackedLink(row.bot_id,payload,landing.landing_url);
-        const action=()=>this.send(config.token,landing.card_image?'sendPhoto':'sendMessage',{chat_id:payload.chat_id,...(landing.card_image?{photo:landing.card_image,caption:landing.card_text}:{text:landing.card_text}),reply_markup:{inline_keyboard:[[{text:landing.button_text,url:link}]]}});
+        const action=async()=>{const result=await this.send(config.token,landing.card_image?'sendPhoto':'sendMessage',{chat_id:payload.chat_id,...(landing.card_image?{photo:landing.card_image,caption:landing.card_text}:{text:landing.card_text}),reply_markup:{inline_keyboard:[[{text:landing.button_text,url:link}]]}});remoteAccepted=true;payload.remote_sent_at=Date.now();messageId=result?.message_id==null?null:String(result.message_id);return result;};
         if(this.store.dispatch)await this.store.dispatch(config.user_id,businessEpoch,'card_send',action,payload.project_id,payload.project_epoch);else await action();
-        await this.finish(row,'sent');
-        if(this.store.event)await this.store.event({user_id:config.user_id,project_id:payload.project_id,bot_id:row.bot_id,environment:payload.environment,type:'card_sent',event_key:`sent:${row.bot_id}:${row.update_id}`,source:payload.source,data:{telegram_user_id:payload.telegram_user_id,version:payload.version}});
+        await this.finish(row,'sent',Date.now(),{message_id:messageId,payload,event:this.sentEvent(row,payload,config.user_id,messageId)});
       }
-      catch(error){if(['USER_DISABLED','BUSINESS_REVOKED','PROJECT_INACTIVE'].includes(error.code))await this.finish(row,'cancelled');else if(error.telegram_code===429&&row.attempts<5)await this.finish(row,'queued',Date.now()+Math.max(1,Math.min(86400,error.retry_after||30))*1000);else await this.finish(row,error.telegram_code>=400&&error.telegram_code<500?'failed':'uncertain');}
+      catch(error){
+        if(error.code==='DELIVERY_LEASE_EXPIRED')return;
+        if(remoteAccepted)await this.finish(row,'uncertain',Date.now(),{message_id:messageId,payload});
+        else if(['USER_DISABLED','BUSINESS_REVOKED','PROJECT_INACTIVE'].includes(error.code))await this.finish(row,'cancelled');
+        else if(error.telegram_code===429&&row.attempts<5)await this.finish(row,'queued',Date.now()+Math.max(1,Math.min(86400,error.retry_after||30))*1000);
+        else await this.finish(row,error.telegram_code>=400&&error.telegram_code<500?'failed':'uncertain');
+      }
     },60);
     if(result.busy){if(row.previous_status==='sending')await this.finish(row,'uncertain');else await this.queue.update(row,{status:'queued',lease:null,lease_until:0,next_at:Date.now()+1000},true);}
   }
@@ -89,6 +127,7 @@ export class Deliveries {
     const config=await this.store.webhookBot(value.bot);if(!config)throw new Failure(404,'Bot 不存在');
     await this.store.assertBusiness(config.user_id,value.epoch);const policy=await this.store.botPolicy(value.bot);
     if(!policy||policy.id!==value.project||policy.environment!==value.environment||policy.status!=='active'||value.environment==='production'&&!policy.published_version)throw new Failure(403,'业务已停止','PROJECT_INACTIVE');
+    if(value.environment==='production'&&!await this.store.isPublishedVersion(policy.id,value.version))throw new Failure(403,'此版本尚未成功发布','VERSION_NOT_PUBLISHED','wait_for_publish');
     const version=await this.store.projectConfig(policy.id,value.version);
     return this.store.dispatch(config.user_id,value.epoch,'landing_redirect',async()=>{await this.store.event({user_id:config.user_id,project_id:policy.id,bot_id:value.bot,environment:value.environment,type:'link_visit',event_key:`click:${randomUUID()}`,source:value.source,data:{version:value.version,...context}});return version.landing.landing_url;},policy.id,value.project_epoch);
   }

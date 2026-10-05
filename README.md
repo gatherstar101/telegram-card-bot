@@ -1,6 +1,6 @@
 # Telegram Bot 自动化平台 · Node.js Docker
 
-`main` 提供当前维护的 Docker API，支持 MySQL 8.0+ 或 PostgreSQL 16+、Redis 6.0+ 和 SMTP。只需构建 `auto-register/` 一个目录，HTTP API、用户鉴权、管理员管理、项目编排、创建任务和 Webhook 投递包含在同一镜像中，默认端口为 **3100**。
+`main` 提供当前维护的 Docker API，支持 MySQL 8.0+ 或 PostgreSQL 16+、Redis 6.0+ Standalone 和 SMTP。只需构建 `auto-register/` 一个目录，HTTP API、用户鉴权、管理员管理、项目编排、创建任务和 Webhook 投递包含在同一镜像中，默认端口为 **3100**。
 
 用户从同一个 API 完成邮箱注册、登录、自有 Telegram App 配置和个人账号认证，随后提交业务项目。系统开通独立测试 Bot、卡片和可选私有 Channel，经测试验收后发布独立生产资源；支持进度查询、失败恢复、配置版本、回滚、来源统计和软禁用。客户提供自己的 Landing Page URL；本服务配置卡片和引导链接，不生成网页。
 
@@ -32,6 +32,8 @@
 GET /v1/onboarding 给出下一阶段。项目使用 project_id，流程使用 workflow_id，底层任务使用 job_id；每步状态入库，接口受理返回 202，查询进度，失败时复用成功步骤。测试与生产使用正式 Telegram 网络的不同 Bot/Token/Webhook Secret，频道按需分别创建。Telegram 有官方独立测试网络，本版本未使用该网络。
 
 配置通过草稿、验收与发布管理。生产读取已发布版本，支持回滚到成功发布过的版本；不会撤回已发送消息。测试 Bot 用 Telegram 数字用户 ID 白名单，生产 Bot 面向实际访客。项目资源不再通过底层 landing/webhook 写接口直接修改。
+
+生产跳转按链接中的具体版本检查成功发布记录；草稿和失败发布版本返回 403 / VERSION_NOT_PUBLISHED。频道发帖发生在最终发布提交之前，帖子中的新版本链接在提交成功后开放；曾成功发布的历史版本链接在回滚后仍有效，但仍受用户/项目状态、授权版本和过期时间约束。新流程先验证 Webhook，再创建频道和发帖。
 
 业务事件、访客可用资料、来源参数与配置版本保存到数据库，原始更新及详细资料加密。统计区分测试与生产，记录启动、投递和追踪链接访问，支持客户成交回传。投递成功不代表已读，链接访问不代表成交。
 
@@ -89,14 +91,19 @@ auto-register/
   api/products.js           统一配置入口、项目草稿、测试/生产流程和版本发布
   api/product-store.js      产品数据、业务停用、身份绑定与事件
   api/product-schema.js     14 张新增产品表，MySQL/PostgreSQL
+  api/migrations.js         同数据库初始化锁、已知字段升级和只读结构检查
   api/tracking.js           签名追踪链接
   sql/init.sql              MySQL 新库 24 张表 SQL
   sql/postgresql/init.sql    PostgreSQL 24 张表与索引 SQL
   sql/002-security.sql      MySQL 旧表字段扩容及辅助表 SQL
+  sql/004-production.sql    MySQL 已有任务归属列及发布/步骤索引升级
+  sql/postgresql/004-production.sql PostgreSQL 对应升级
+  sql/005-reliability.sql   MySQL 手机号索引与投递回执列升级
+  sql/postgresql/005-reliability.sql PostgreSQL 对应升级
   Dockerfile / compose.yaml 单镜像部署
   .env.example              完整运行时变量模板
   PRODUCTION.md             安全升级与生产运行说明
-  scripts/                  旧会话归属迁移、独立 Bot 创建脚本
+  scripts/                  数据库初始化、手机号索引补齐、旧会话归属迁移、独立 Bot 创建脚本
   test/                     单元与可选真实 MySQL/PostgreSQL 与 Redis 集成验证
 card-bot/                   已弃用 / 不可用，仅归档历史源码
 ```
@@ -117,7 +124,7 @@ DB_AUTO_CREATE_DATABASE=true
 
 DB_TYPE 支持 mysql 和 postgresql；DB_DATABASE 仅允许字母、数字、下划线，MySQL 最长 64 字符，PostgreSQL 最长 63 字符。更换库名会连接另一个库，不自动复制旧数据；更换 DB_TYPE 也不会跨引擎迁移数据。
 
-`DB_AUTO_CREATE_DATABASE=true` 时启动自动建库，随后初始化 24 张表及索引。MySQL 需要建库权限；PostgreSQL 需要 CREATEDB 和维护库连接权限。已有库可设置 false，跳过建库，仍初始化表/索引。MySQL 旧凭据列扩容和已知缺失产品列升级还需要 ALTER 权限。数据库账号同时需要业务读写权限，完整连接/TLS 设置见[环境变量](#configuration)。
+`DB_AUTO_CREATE_DATABASE=true` 时启动自动建库；`DB_SCHEMA_INIT=true`（默认）随后在数据库初始化锁内创建 24 张表、索引及已知缺失列。MySQL 需要建库权限；PostgreSQL 需要 CREATEDB 和维护库连接权限。已有库可设置 DB_AUTO_CREATE_DATABASE=false 跳过建库；已完成升级的生产运行账号同时设置 DB_SCHEMA_INIT=false，只校验表与必要列，不执行 DDL。自动初始化账号需 CREATE/ALTER 等权限，运行账号需业务读写权限；PostgreSQL 自增字段还需 sequence 的 USAGE/SELECT。完整配置见[环境变量](#configuration)。
 
 ### 完整表名与用途
 
@@ -130,7 +137,7 @@ DB_TYPE 支持 mysql 和 postgresql；DB_DATABASE 仅允许字母、数字、下
 | `user_limits` | user_id | 用户资源/并发配额覆盖 |
 | `audit_logs` | id（自增） | 管理操作时间、操作者、IP、UA、目标用户、结果及脱敏变更 |
 | `telegram_apps` | id | 自有 api_id、加密 api_hash、App 配置版本 |
-| `tg_info` | account_id | 用户归属、Telegram 凭据、加密 Session、认证和恢复状态 |
+| `tg_info` | account_id | 用户归属、Telegram 凭据、加密 Session、phone_key 查询摘要、认证和恢复状态 |
 | `account_profiles` | account_id | 账号使用的 app_config_id 和 app_version |
 | `telegram_identities` | telegram_user_id | 认证后的 Telegram 数字身份、平台用户与账号绑定 |
 | `telegram_phone_claims` | phone_key | 认证后的手机号 SHA-256 摘要与账号绑定 |
@@ -142,8 +149,8 @@ DB_TYPE 支持 mysql 和 postgresql；DB_DATABASE 仅允许字母、数字、下
 | `project_resources` | project_id + environment + kind | 项目 test/production 环境的 Bot/Channel 资源绑定 |
 | `workflow_runs` | id | 开通与发布流程、执行状态、授权版本、租约及调度时间 |
 | `workflow_steps` | workflow_id + position | 分步进度、job_id、重试次数、时间和错误 |
-| `api_jobs` | id（64 字符摘要） | 底层创建/核对任务、幂等参数、检查点、租约与结果 |
-| `webhook_deliveries` | bot_id + update_id | Telegram Update 去重、加密投递载荷、状态和重试 |
+| `api_jobs` | id（64 字符摘要） | 底层创建/核对任务、project_id/workflow_id 归属、幂等参数、检查点、租约与结果 |
+| `webhook_deliveries` | bot_id + update_id | Telegram Update 去重、加密载荷、投递状态、remote_message_id 回执和重试 |
 | `telegram_visitors` | bot_id + telegram_user_id | 加密访客资料、首次/最近出现时间 |
 | `business_events` | id | 来源、启动、投递、跳转、成交回传及加密原始更新 |
 | `business_dispatches` | id | 派发许可、操作类型、开始/完成时间和结果状态 |
@@ -180,8 +187,12 @@ PostgreSQL 对应 user_id 为 VARCHAR(36)，不使用 ENGINE/CHARSET 子句。AP
 | [MySQL 002-security.sql](auto-register/sql/002-security.sql) | 旧凭据字段扩容与安全/队列辅助表，不是完整新库初始化 |
 | [MySQL 003-product.sql](auto-register/sql/003-product.sql) | 新增 14 张产品表及索引，不包含原有十张表 |
 | [PostgreSQL 003-product.sql](auto-register/sql/postgresql/003-product.sql) | 新增 14 张产品表及索引，使用 PostgreSQL 方言 |
+| [MySQL 004-production.sql](auto-register/sql/004-production.sql) | 已有库追加任务归属列及发布/步骤关联索引，手动执行仅一次 |
+| [PostgreSQL 004-production.sql](auto-register/sql/postgresql/004-production.sql) | 对应已有库升级，列和索引使用 IF NOT EXISTS |
+| [MySQL 005-reliability.sql](auto-register/sql/005-reliability.sql) | 已有库追加 phone_key、ix_tg_phone 及 remote_message_id；手动执行仅一次 |
+| [PostgreSQL 005-reliability.sql](auto-register/sql/postgresql/005-reliability.sql) | 对应已有库升级；完成结构升级后仍需运行手机号索引补齐脚本 |
 
-正常部署由服务自动初始化，不必再手动执行 SQL。运行时定义位于 api/schema.js、api/postgres-schema.js 和 api/product-schema.js。启动使用 IF NOT EXISTS 建表并检查索引，仅升级代码中明确列出的旧字段；它不是通用 schema 同步工具，不会自动把任意旧表改为新表定义，也不删除现有业务数据。
+默认部署由服务自动初始化，不必再手动执行 SQL。运行时定义位于 api/schema.js、api/postgres-schema.js 和 api/product-schema.js，初始化由 api/migrations.js 在同一数据库连接及初始化锁内执行。也可用独立迁移账号运行 npm run migrate，随后用 DB_SCHEMA_INIT=false 的业务账号启动。只升级代码中明确列出的旧字段；它不是通用 schema 同步工具，不会自动把任意旧表改为新表定义，也不删除现有业务数据。
 
 需要手动初始化时，先创建目标数据库，再选择对应引擎的完整 init.sql。SQL 文件不写死库名，也不负责 CREATE DATABASE。以下命令在仓库根目录执行，DB_HOST、DB_PORT、DB_USER、DB_DATABASE 为调用方设置的连接变量；密码由客户端交互提示输入：
 
@@ -244,10 +255,12 @@ init.sql 已包含产品表，新库无需再执行 003-product.sql。MySQL 手�
 | `DB_HOST` | 必填，现有 MySQL 或 PostgreSQL 地址，容器内 localhost 指向 API 自己 |
 | `DB_PORT` | 留空按 DB_TYPE 选择：mysql=3306，postgresql=5432 |
 | `DB_DATABASE` | 必填，字母、数字、下划线；MySQL 最长 64，PostgreSQL 最长 63 位 |
-| `DB_USER` / `DB_PASSWORD` | 必填，需业务读写及表/索引初始化权限；自动建库还需建库权限 |
+| `DB_USER` / `DB_PASSWORD` | 必填，需业务读写权限；DB_SCHEMA_INIT=true 还需表/索引 DDL，自动建库还需建库权限 |
 | `DB_POOL_SIZE` | 10，允许 1–100，每个 API 副本的连接池大小 |
 | `DB_CONNECT_TIMEOUT_MS` | 5000，允许 1000–30000 |
-| `DB_AUTO_CREATE_DATABASE` | true；已有库且无建库权限时设置 false，仍会初始化表/索引 |
+| `DB_AUTO_CREATE_DATABASE` | true；已有库且无建库权限时设置 false；结构初始化由 DB_SCHEMA_INIT 独立控制 |
+| `DB_SCHEMA_INIT` | true；自动建表/升级。false 仅校验结构，同时必须设置 DB_AUTO_CREATE_DATABASE=false |
+| `DB_SCHEMA_LOCK_TIMEOUT_SECONDS` | 60，允许 1–300；同库自动初始化等待数据库锁的最长时间，超时拒绝启动 |
 | `DB_MAINTENANCE_DATABASE` | postgres；PostgreSQL 自动建库时连接的维护库，MySQL 忽略 |
 | `DB_SSL_MODE` | disable 或 verify-full；后者验证服务端证书及主机名 |
 | `DB_SSL_CA` | 可选自定义 CA PEM；在 .env 单行中用字面量 \n 表示换行 |
@@ -287,6 +300,34 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 
 SMTP 暂不配置仍可启动并访问 `/health`，管理员初始化及 `/admin/login` 可用；普通用户发码及 `/ready` 返回 503。PUBLIC_BASE_URL 在登录和创建资源阶段可以留空；真实 Telegram 回调需要 HTTPS 公网地址。它是 API 地址，客户页面地址另通过 landing API 设置。
 
+<a id="redis-deployment"></a>
+
+### Redis 部署模式与配置
+
+当前版本支持 **Redis Standalone 单实例连接**，已完成真实 Redis 的验证码、会话、限流、封禁与锁回归。**原生 Redis Cluster 分片集群尚未适配，也未验证 Sentinel 自动发现与切换。** 多个 API 副本共享一个 Redis 地址不等于 Redis Cluster。
+
+| 部署模式 | 当前支持范围 |
+| --- | --- |
+| Standalone | 支持；使用 REDIS_URL，或 REDIS_HOST/REDIS_PORT 与独立认证配置 |
+| Redis Cluster | 未实现 createCluster、种子节点配置及集群拓扑路由；不能直接把 REDIS_HOST 改为集群节点地址 |
+| Sentinel | 未实现 Sentinel 节点发现及主节点自动切换；现有变量只配置普通连接地址 |
+
+Standalone 示例，以下全部在容器运行时传入：
+
+```dotenv
+REDIS_URL=
+REDIS_HOST=host.docker.internal
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_USER=
+REDIS_PASSWORD=YOUR_REDIS_PASSWORD
+REDIS_KEY_PREFIX=telegram-bot:
+```
+
+设置 REDIS_URL 时，地址、用户名、密码和逻辑 DB 从 URL 读取，覆盖独立连接字段；例如 redis://USER:URL_ENCODED_PASSWORD@HOST:6379/0。多副本共用 REDIS_KEY_PREFIX，测试与生产使用不同前缀。Standalone 的 REDIS_DB 默认 0；逻辑 DB 和前缀不能代替访问权限控制。
+
+Cluster 后续需采用 [node-redis 的 createCluster](https://github.com/redis/node-redis/blob/master/docs/clustering.md)，并给发现的节点统一配置认证/TLS及可达地址。原生 Cluster [仅支持 DB 0](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)。现有验证码、限流、封禁和锁脚本均只操作一个 Key，具备适配基础，但集群连接、重定向、重分片和故障切换仍须实现与回归。此前讨论的 REDIS_MODE、REDIS_CLUSTER_NODES 是待实现方案，当前代码不读取这两个变量，请勿据此配置集群。
+
 ### 数据库选择与配置升级
 
 所有数据库业务变量统一使用 `DB_*`，旧前缀不再读取。已有部署升级前，需要把原数据库变量改为上表对应的 DB_* 名称，保持地址、库名、账号、密码和密钥值不变；只修改变量名称不会迁移或重建已有数据。
@@ -319,11 +360,11 @@ DB_SSL_MODE=verify-full
 DB_SSL_CA=
 ```
 
-PostgreSQL 自动建库要求账号具备 CREATEDB 且能够连接维护库；已有数据库可以设置 false，账号仍需目标 schema 的建表/建索引权限与表读写权限。MySQL 自动建库及旧列升级需对应 CREATE/ALTER 权限。TLS 连接设置 verify-full，使用系统信任 CA 或 DB_SSL_CA 指定 CA；受控本地数据库未启用 TLS 时使用 disable。
+PostgreSQL 自动建库要求账号具备 CREATEDB 且能够连接维护库。已有数据库设置 DB_AUTO_CREATE_DATABASE=false；自动建表和升级仍需 DDL 权限。先迁移，再设置 DB_SCHEMA_INIT=false，可使用仅有表读写、schema USAGE 和 sequence USAGE/SELECT 的运行账号。MySQL 同样可分离迁移与运行账号。TLS 连接设置 verify-full，使用系统信任 CA 或 DB_SSL_CA 指定 CA；受控本地数据库未启用 TLS 时使用 disable。
 
 **切换 DB_TYPE 不会迁移 MySQL/PostgreSQL 之间的数据**，新数据库需要另行导入匹配结构的数据及原密钥。两个后端保留邮箱和 Bot 用户名大小写不敏感、请求 key 大小写敏感的行为，64 位 ID 按字符串处理。
 
-可选手动初始化：先由管理员创建 DB_DATABASE，选择该库后执行 [MySQL init.sql](auto-register/sql/init.sql) 或 [PostgreSQL init.sql](auto-register/sql/postgresql/init.sql)。MySQL 旧列升级见 [002-security.sql](auto-register/sql/002-security.sql)。SQL 不写死数据库名；mysql 使用 -D，psql 使用 -d 指定目标库。服务启动仍会进行幂等建表检查。
+可选手动初始化：先由管理员创建 DB_DATABASE，选择该库后执行 [MySQL init.sql](auto-register/sql/init.sql) 或 [PostgreSQL init.sql](auto-register/sql/postgresql/init.sql)。MySQL 旧列升级见 [002-security.sql](auto-register/sql/002-security.sql)，已有任务归属升级见各引擎 004-production.sql，手机号索引和投递回执列升级见 005-reliability.sql。SQL 不写死数据库名；mysql 使用 -D，psql 使用 -d 指定目标库。DB_SCHEMA_INIT=true 时启动继续进行锁内幂等检查，false 时只校验表与必要列。
 
 ### 限流、配额与队列配置
 
@@ -343,7 +384,7 @@ PostgreSQL 自动建库要求账号具备 CREATEDB 且能够连接维护库；�
 | `TELEGRAM_TIMEOUT_SECONDS` | 60 | 15–240；同步 Telegram 连接与操作总超时 |
 | `JOB_TIMEOUT_SECONDS` | 240 | 30–240；任务内 Telegram 连接与操作总超时 |
 | `JOB_QUEUE_LIMIT` | 20 | 1–100；同手机号 queued/running 任务总上限 |
-| `JOB_RETENTION_SECONDS` | 604800 | 86400–2592000；完成、失败、取消任务保留秒数；uncertain 保留至核对 |
+| `JOB_RETENTION_SECONDS` | 604800 | 86400–2592000；完成、失败、取消任务保留秒数；未结束流程引用的任务和 uncertain 继续保留 |
 | `WEBHOOK_CHAT_PER_MINUTE` | 5 | 1–60；每 Bot 每私聊分钟卡片上限 |
 | `WEBHOOK_BOT_PER_MINUTE` | 300 | 1–3000；每 Bot 分钟卡片上限 |
 | `WEBHOOK_QUEUE_LIMIT` | 500 | 1–10000；每 Bot 待处理投递上限，队列满返回 503 |
@@ -380,7 +421,16 @@ curl http://127.0.0.1:3100/ready
 
 默认宿主机与容器内部均使用 3100，Compose 映射为 `127.0.0.1:3100:3100`。API_PORT 和 PORT 都无需手动配置；API_PORT 仅修改 Compose 的宿主机端口。直接运行镜像时使用 `docker run -p 127.0.0.1:3100:3100 --env-file .env YOUR_IMAGE`。若显式覆盖 PORT，docker run 的映射目标端口也需同步调整。
 
-启动按 DB_TYPE 选择驱动、按 DB_DATABASE 自动建库并初始化 24 张表和索引，然后直接初始化管理员、连接 Redis、启动 HTTP 和后台队列。设置 DB_AUTO_CREATE_DATABASE=false 时只连接已有库并初始化表/索引。MySQL 还会扩容已知旧凭据列为 TEXT/MEDIUMTEXT，此步骤不加密旧数据，管理员需完成分页迁移。PostgreSQL 使用独立建表 SQL 和 JSONB 字段，队列在两种数据库中都使用事务与 FOR UPDATE SKIP LOCKED。初始化应串行发布。
+启动按 DB_TYPE 选择驱动、按 DB_DATABASE 自动建库；DB_SCHEMA_INIT=true 时在数据库锁内初始化 24 张表、索引和已知缺失列，然后直接初始化管理员、连接 Redis、启动 HTTP 和后台队列。DB_AUTO_CREATE_DATABASE=false 只跳过建库；DB_SCHEMA_INIT=false 额外跳过 DDL，缺表/必要列时拒绝启动。MySQL 已知旧凭据列扩容不加密旧数据，管理员仍需分页迁移。PostgreSQL 使用独立 SQL 和 JSONB；两个数据库均使用事务与 FOR UPDATE SKIP LOCKED 领取任务。同版本初始化由数据库锁串行处理，跨版本升级仍需维护窗口停止旧版本写入。
+
+生产可先用迁移账号初始化，再用业务账号运行同一个镜像；两个文件都是运行时配置，迁移文件使用 DDL 账号，业务文件设置 DB_AUTO_CREATE_DATABASE=false、DB_SCHEMA_INIT=false：
+
+```bash
+docker run --rm --env-file .env.migrate YOUR_IMAGE node scripts/migrate.js
+docker run -d -p 127.0.0.1:3100:3100 --env-file .env YOUR_IMAGE
+# 本地迁移：auto-register/ 下
+node --env-file=.env.migrate scripts/migrate.js
+```
 
 容器使用 Node.js 22、非 root 用户、只读根文件系统、临时目录 tmpfs、移除 capabilities、init 和 6 分钟退出宽限。DATA_DIR 卷保留旧迁移兼容用途。Docker HEALTHCHECK 使用 `/health`，SMTP 未配也可运行基础服务；正式流量切换应检查 `/ready`。
 
@@ -413,7 +463,7 @@ App 路径的 `:id` 为 app_config_id，项目路径的 `:id` 为 project_id，�
 | 方法 | 路径 | 鉴权 | 参数 / 结果 |
 | --- | --- | --- | --- |
 | GET | `/health` | 无 | 可响应检查，返回 ok |
-| GET | `/ready` | 无 | 检查必要配置、数据库和 Redis；不可用时 503 |
+| GET | `/ready` | 无 | 检查必要配置、数据库、Redis 和历史手机号索引完整性；不可用时 503 |
 | POST | `/auth/register/start` | 无 | email、password → challenge_id、expires_in |
 | POST | `/auth/register/verify` | 无 | challenge_id、code → user、access_token |
 | POST | `/auth/login/start` | 无 | email、password → challenge_id、expires_in |
@@ -473,8 +523,9 @@ App 路径的 `:id` 为 app_config_id，项目路径的 `:id` 为 project_id，�
 | POST | `/v1/accounts/:id/channels/:key/reconcile` | request_key、channel_id、access_hash → 202 核对任务 |
 | GET | `/v1/accounts/:id/jobs/:job_id` | 任务状态、成功 result 或失败 error |
 | POST | `/v1/accounts/:id/jobs/:job_id/retry` | `{}`；202，安全重试或要求先核对 |
-| GET | `/v1/accounts/:id/bots/:username/deliveries/:update_id` | Webhook 投递状态 |
+| GET | `/v1/accounts/:id/bots/:username/deliveries/:update_id` | Webhook 投递状态、message_id（字符串或 null） |
 | POST | `/v1/accounts/:id/bots/:username/deliveries/:update_id/retry` | uncertain 时必须传 allow_duplicate=true |
+| POST | `/v1/accounts/:id/bots/:username/deliveries/:update_id/reconcile` | `{}`；200，仅按已保存成功回执补齐事件/状态，不发送消息；无回执返回 409 |
 
 ### Webhook 与管理员
 
@@ -545,7 +596,14 @@ curl -X POST "$BASE_URL/v1/accounts/$ACCOUNT_ID/verify" \
   -d '{"code":"YOUR_TELEGRAM_CODE"}'
 ```
 
-返回 `password_required` 时向 verify 再提交 `{"password":"YOUR_TELEGRAM_2FA_PASSWORD"}`，最终应为 authorized。服务不读取客户端验证码，不保存验证码或两步验证密码。登录流程固定 10 分钟，Telegram 验证码可能提前过期。重复 start 已授权账号优先复用 account_id；需要重新发码时传 reauthenticate=true。API 不读取平台 TG_API_ID/TG_API_HASH 默认值。
+返回 `password_required` 时向 verify 再提交 `{"password":"YOUR_TELEGRAM_2FA_PASSWORD"}`，最终应为 authorized。Telegram 身份和正式手机号归属在同一数据库事务中写入。服务不读取客户端验证码，不保存验证码或两步验证密码。登录流程固定 10 分钟，Telegram 验证码可能提前过期。重复 start 已授权账号优先复用 account_id；需要重新发码时传 reauthenticate=true。API 不读取平台 TG_API_ID/TG_API_HASH 默认值。
+
+如果 Telegram 已认证而本地绑定暂时无法保存，verify 返回 HTTP 503、`code=IDENTITY_PERSISTENCE_FAILED`、`next_action=retry_verify`，账号保存为 `identity_pending` 并保留加密 Session。此时不能创建 Bot/Channel 或开通项目；恢复数据库后向同一 verify 接口提交 `{}`，重新读取远端身份并完成绑定，无需重用验证码。重复 start 返回该账号和 retry_verify；归属冲突标为 identity_conflict 并清空本地 Session，临时数据库故障不按归属冲突处理。
+
+```bash
+curl -X POST "$BASE_URL/v1/accounts/$ACCOUNT_ID/verify" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application/json' -d '{}'
+```
 
 ### 3. 保存项目并预览
 
@@ -582,7 +640,7 @@ curl "$BASE_URL/v1/projects/$PROJECT_ID/workflows/$WORKFLOW_ID" \
   -H "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
-202 表示受理，不能视为远端创建成功。系统推进 create_bot、configure_landing、register_webhook、可选 create_channel/publish_post、verify_webhook，最后进入 waiting_test。响应包含 status、stage、completed_steps、total_steps、steps、错误和 next_action。
+202 表示受理，不能视为远端创建成功。新流程推进 create_bot、configure_landing、register_webhook、verify_webhook、可选 create_channel/publish_post，最后进入 waiting_test。响应包含 status、stage、completed_steps、total_steps、steps、错误和 next_action；升级前已存在的流程保留原步骤顺序。
 
 白名单测试账号打开测试 Bot，按 Start，核对卡片并点击按钮确认目标页面。存在本版本卡片发送成功和追踪链接访问记录后，提交验收：
 
@@ -728,16 +786,22 @@ Bot 核对请求已有 Token，不再次执行 /newbot。Channel 核对要求已
 
 明确 Telegram 429 按 retry_after 重试，最多 5 次；明确 4xx 标为 failed。网络错误、5xx 或发送中断标为 uncertain，不自动重发，因为 sendMessage 没有远端幂等键。
 
+发送完成后，在同一数据库事务内校验当前租约、保存 sent、message_id 和 card_sent 事件；事务失败不会留下 sent 但缺失事件的状态。已收到远端成功回执而本地保存失败时，优先标 uncertain 并保存 message_id。查询有回执的 uncertain 投递后，先调用 reconcile，仅补齐本地证据，不再次发卡；操作幂等，保留原投递时间。没有成功回执返回 DELIVERY_RECEIPT_REQUIRED，需人工核对。若整个数据库不可用或进程在落库前中断，回执可能无法保存，恢复后仍按未知结果处理。
+
 ```bash
 UPDATE_ID='123456'
 curl "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/deliveries/$UPDATE_ID" \
   -H "Authorization: Bearer $ACCESS_TOKEN"
+# uncertain 且 message_id 非 null：先补齐本地状态，不重发
+curl -X POST "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/deliveries/$UPDATE_ID/reconcile" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application/json' -d '{}'
+# 没有可保存的回执且决定重新发送时，明确接受重复风险
 curl -X POST "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/deliveries/$UPDATE_ID/retry" \
   -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"allow_duplicate":true}'
 ```
 
-投递状态为 queued、sending、sent、failed、uncertain、cancelled。uncertain 重试必须明确传 allow_duplicate=true，可能产生重复消息；failed 重试无需该字段。只有对应 Bot 所有者可查询和重试。cancelled 投递不能手动重放，访客需要新的 Start；项目投递使用接收时的配置版本。
+投递状态为 queued、sending、sent、failed、uncertain、cancelled。uncertain 重试必须明确传 allow_duplicate=true，可能产生重复消息；failed 重试无需该字段。只有对应 Bot 所有者可查询、核对和重试。cancelled 投递不能手动重放，访客需要新的 Start；项目投递使用接收时的配置版本。
 
 ### 注销、改密与 Token 更新
 
@@ -795,6 +859,22 @@ curl -X PUT "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/token" \
 
 ## 升级与生产运行
 
+已有 tg_info 数据的安装，先停止账号写入并完成结构迁移，再补齐手机号摘要索引。新库无需补齐；索引缺失时 `/ready` 返回 503，login/start 返回 PHONE_INDEX_NOT_READY，避免遗漏旧账号归属。以下命令在 auto-register/ 下运行：
+
+```bash
+# .env.migrate 是具备 DDL 权限的数据库账号；结构迁移无需 Redis、SMTP 或加密密钥
+node --env-file=.env.migrate scripts/migrate.js
+# .env 使用数据库读写账号，并提供包含历史版本的 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID
+node --env-file=.env scripts/backfill-phones.js
+# 已向当前 shell 注入上述运行时变量时，也可运行 npm run backfill:phones
+# Docker 使用同一镜像完成两步迁移
+# 容器访问本地依赖时按所在网络配置 DB_HOST
+docker run --rm --env-file .env.migrate YOUR_IMAGE node scripts/migrate.js
+docker run --rm --env-file .env YOUR_IMAGE node scripts/backfill-phones.js
+```
+
+补齐脚本按 account_id 分批处理 phone_key=NULL 的记录，保留手机号密文；中断后重复运行会跳过已完成记录。支持旧明文手机号仅用于这个离线迁移命令，普通 API 继续拒绝明文；未知密钥、解密失败或无效手机号会停止并要求修复。脚本只输出数量，不输出手机号或 Session。phone_key 是手机号 SHA-256 查询摘要，不作为已验证归属；telegram_phone_claims 仍在认证成功后才登记。正常登录通过索引查询，不全量解密历史账号。
+
 先备份旧库与密钥，在维护窗口停止旧版本写入。配置必填 ADMIN_EMAIL/ADMIN_PASSWORD 和 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID，可选配置 ADMIN_API_KEY，启动新版自动建表和扩容后，用管理员接口分页加密旧凭据：
 
 ```bash
@@ -811,7 +891,7 @@ curl -X POST "$BASE_URL/admin/credentials/rewrap" \
 
 旧 JSON 迁移仍可用 MIGRATE_ACCOUNT_ID、MIGRATE_EMAIL、DATA_DIR 和 `npm run assign:account`，先让归属邮箱完成注册。独立脚本通过 `scripts/create-bot.env` 和 `npm run create:bot` 创建 Bot，仍由该脚本管理本地会话与 Token，与平台用户 API 分开。
 
-`/ready` 验证配置和数据库/Redis 可用性，不实际发送邮件或登录 Telegram。监控 HTTP 5xx、队列积压、failed/uncertain、Redis/数据库可用性和容量，并配置通知与恢复演练。数据库与 Redis 需自行提供持久化/备份和故障切换；Redis 丢失会话后用户重新邮箱登录，Telegram 会话仍在数据库。数据库恢复不能撤销远端 Telegram 动作，恢复后核对任务/投递状态，避免重复。
+`/ready` 验证配置、数据库/Redis 可用性和历史手机号索引完整性，不实际发送邮件或登录 Telegram。监控 HTTP 5xx、队列积压、failed/uncertain、Redis/数据库可用性和容量，并配置通知与恢复演练。数据库与 Redis 需自行提供持久化/备份和故障切换；Redis 丢失会话后用户重新邮箱登录，Telegram 会话仍在数据库。数据库恢复不能撤销远端 Telegram 动作，恢复后核对任务/投递状态，避免重复。
 
 完整升级、密钥轮换、备份和容量边界见 [Docker 生产运行手册](auto-register/PRODUCTION.md)。
 
@@ -827,10 +907,14 @@ npm test
 INTEGRATION_TEST=1 TEST_API_URL=http://127.0.0.1:3100 \
   node --env-file=.env --test test/integration.test.js
 SECURITY_INTEGRATION=1 node --env-file=.env --test --test-concurrency=1 \
-  test/database.test.js test/admin.test.js test/security.test.js test/products.test.js test/upgrade.test.js
+  test/database.test.js test/admin.test.js test/security.test.js test/products.test.js test/production.test.js test/reliability.test.js test/upgrade.test.js
 ```
 
 本地依赖地址与 Docker 地址可能不同，按测试所在网络调整 DB_HOST/REDIS_HOST，REDIS_URL 若已填写仍优先。集成测试应使用独立测试库与 Redis prefix；原鉴权集成需要已运行的同配置 API，安全集成自己启动临时 HTTP 服务。SMTP 测试使用本地接收器，不需要实际外部邮箱。
+
+可靠性回归 test/reliability.test.js 额外覆盖身份/手机号绑定回滚、跨副本身份争用、保留 Session 后重试 verify、手机号索引迁移与中断恢复、投递状态与事件原子提交、回执核对、租约丢失及零更新行数。项目 HTTP 回归验证事件写入失败后通过 reconcile 补齐证据，再完成测试验收，且不会再次发卡。
+
+生产边界回归另覆盖 DB_POOL_SIZE=1、关联写入失败回滚、未提交任务不可领取、暂停拦截、关联缺失拒绝执行、恢复数据保留、租约失效、后台重试、双实例启动升级和无 DDL 权限运行。HTTP 发布回归检查新版本链接发布前拒绝、成功后开放及回滚后历史链接保留。该测试创建临时数据库及仅有业务权限的测试账号，运行测试的数据库管理账号需建库及管理测试角色权限；应用运行账号不需要这些权限。
 
 真实 MySQL/PostgreSQL、Redis 与 HTTP 验证覆盖管理员初始化/直接登录、用户修改和越权拒绝、Redis IP 封禁（并发计数、TTL 到期与封禁审计）、审计事务回滚与持久化，以及加密读写、旧凭据迁移、会话撤销、QPS/60 秒冷却、任务持久化/领取/中断恢复/核对、Webhook 去重/429/未知结果重试。产品回归还覆盖 App 归属、统一开通、测试/生产隔离、失败恢复、版本回滚、来源统计、项目暂停/归档、历史流程取消、执行中禁用、重新启用后登录、密码恢复和全表密钥轮换。Telegram 副作用使用模拟执行器，真实用户登录、BotFather 创建、Channel/帖子、公网 Webhook 和外部 SMTP 投递仍需单独验收。GitHub Actions 仅通过 workflow_dispatch 手动运行，不再由 push 或 pull_request 自动触发；在 Actions → Docker API checks → Run workflow 中选择 main。工作流分别验证 mysql/postgresql 两个后端，MySQL 旧列升级测试仅在 MySQL 执行。构建与单元测试通过不等于已达到线上可用性 SLA。
 

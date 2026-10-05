@@ -1,4 +1,4 @@
--- Administrator roles and persistent operation audit.
+-- Database is supplied by the caller; schema is non-destructive.
 CREATE TABLE IF NOT EXISTS user_admins (
     user_id CHAR(36) NOT NULL PRIMARY KEY
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -12,9 +12,6 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     status INT NOT NULL, changes JSON NOT NULL,
     KEY ix_audit_target (target_id,id), KEY ix_audit_time (completed_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- MySQL 8.0+. Select the DB_DATABASE target before running.
--- Database creation is managed by the service or administrator.
 
 CREATE TABLE IF NOT EXISTS user_info (
     id CHAR(36) NOT NULL PRIMARY KEY,
@@ -30,6 +27,7 @@ CREATE TABLE IF NOT EXISTS tg_info (
     api_id BIGINT UNSIGNED NOT NULL,
     api_hash TEXT NOT NULL,
     phone TEXT NOT NULL,
+    phone_key VARCHAR(64) NULL,
     session MEDIUMTEXT NOT NULL,
     status VARCHAR(32) NOT NULL,
     expires_at BIGINT NULL,
@@ -38,7 +36,7 @@ CREATE TABLE IF NOT EXISTS tg_info (
     pending_channel MEDIUMTEXT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    KEY ix_tg_user (user_id)
+    KEY ix_tg_user (user_id), KEY ix_tg_phone (phone_key,status,user_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS bot_info (
@@ -96,6 +94,7 @@ CREATE TABLE IF NOT EXISTS channel_posts (
 
 CREATE TABLE IF NOT EXISTS api_jobs (
     id CHAR(64) PRIMARY KEY, account_id CHAR(36) NOT NULL, user_id CHAR(36) NOT NULL,
+    project_id VARCHAR(36) NULL, workflow_id VARCHAR(36) NULL,
     phone_key CHAR(64) NOT NULL, auth_version BIGINT NOT NULL, path VARCHAR(512) NOT NULL,
     body MEDIUMTEXT NOT NULL, fingerprint CHAR(64) NOT NULL, status VARCHAR(16) NOT NULL,
     effect VARCHAR(32) NULL, result MEDIUMTEXT NULL, error JSON NULL,
@@ -107,12 +106,12 @@ CREATE TABLE IF NOT EXISTS api_jobs (
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     bot_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, update_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     payload TEXT NOT NULL, status VARCHAR(16) NOT NULL, attempts INT NOT NULL DEFAULT 0,
+    remote_message_id VARCHAR(32) NULL,
     lease CHAR(36) NULL, lease_until BIGINT NOT NULL DEFAULT 0, next_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
     PRIMARY KEY(bot_id,update_id), KEY ix_deliveries_pending(status,next_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Product schema additions
 CREATE TABLE IF NOT EXISTS telegram_apps (id VARCHAR(36) PRIMARY KEY,user_id VARCHAR(36) NOT NULL,name VARCHAR(64) NOT NULL,api_id BIGINT NOT NULL,api_hash TEXT NOT NULL,version INT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS telegram_identities (telegram_user_id VARCHAR(32) PRIMARY KEY,user_id VARCHAR(36) NOT NULL,account_id VARCHAR(36) NOT NULL UNIQUE,profile TEXT NOT NULL,updated_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -148,6 +147,10 @@ CREATE INDEX ix_projects_user ON project_info (user_id,id);
 CREATE INDEX ix_workflows_pending ON workflow_runs (status,next_at);
 
 CREATE INDEX ix_events_user ON business_events (user_id,occurred_at);
+
+CREATE INDEX ix_workflows_release ON workflow_runs (project_id,environment,version,status);
+
+CREATE INDEX ix_steps_job ON workflow_steps (job_id);
 
 CREATE INDEX ix_events_project ON business_events (project_id,occurred_at);
 

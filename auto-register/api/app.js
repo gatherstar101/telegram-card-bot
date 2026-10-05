@@ -74,7 +74,7 @@ export function createApplication({store,auth,service,jobs,deliveries,products,e
       if(method==='POST'&&/\/(bots|channels)$/.test(path))await rate(auth.cache,env,'telegram-create',user.id,integer(env,'TG_CREATE_PER_TEN_MINUTES',10,1,100),600);
       const jobMatch=path.match(/\/jobs\/([a-f0-9]{64})(?:\/(retry))?$/);if(jobMatch){if(method==='GET'&&!jobMatch[2])return respond(200,jobs.view(await jobs.get(jobMatch[1],user,account)));if(method==='POST'&&jobMatch[2])return respond(202,await jobs.retry(jobMatch[1],user,account));throw new Failure(404,'接口不存在');}
       if(method==='POST'&&isTask(path))return respond(202,await jobs.enqueue(path,body,user,account));
-      const deliveryMatch=path.match(/\/bots\/([A-Za-z0-9_]+)\/deliveries\/(\d+)(?:\/(retry))?$/);if(deliveryMatch){const row=await deliveries.owned(user,account,deliveryMatch[1],deliveryMatch[2]);if(method==='GET'&&!deliveryMatch[3])return respond(200,deliveries.view(row));if(method==='POST'&&deliveryMatch[3])return respond(200,await deliveries.retry(row,body.allow_duplicate));throw new Failure(404,'接口不存在');}
+      const deliveryMatch=path.match(/\/bots\/([A-Za-z0-9_]+)\/deliveries\/(\d+)(?:\/(retry|reconcile))?$/);if(deliveryMatch){const row=await deliveries.owned(user,account,deliveryMatch[1],deliveryMatch[2]);if(method==='GET'&&!deliveryMatch[3])return respond(200,deliveries.view(row));if(method==='POST'&&deliveryMatch[3]==='retry')return respond(200,await deliveries.retry(row,body.allow_duplicate));if(method==='POST'&&deliveryMatch[3]==='reconcile')return respond(200,await deliveries.reconcile(row));throw new Failure(404,'接口不存在');}
       return respond(200,await service.route(method,path,body,user));
     }catch(error){
       if(adminContext&&adminAuthenticationFailed){

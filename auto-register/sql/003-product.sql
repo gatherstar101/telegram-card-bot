@@ -35,6 +35,10 @@ CREATE INDEX ix_workflows_pending ON workflow_runs (status,next_at);
 
 CREATE INDEX ix_events_user ON business_events (user_id,occurred_at);
 
+CREATE INDEX ix_workflows_release ON workflow_runs (project_id,environment,version,status);
+
+CREATE INDEX ix_steps_job ON workflow_steps (job_id);
+
 CREATE INDEX ix_events_project ON business_events (project_id,occurred_at);
 
 CREATE INDEX ix_dispatch_user ON business_dispatches (user_id,status);

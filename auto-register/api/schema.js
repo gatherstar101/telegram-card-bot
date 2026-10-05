@@ -24,6 +24,7 @@ export const tables = [
     api_id BIGINT UNSIGNED NOT NULL,
     api_hash TEXT NOT NULL,
     phone TEXT NOT NULL,
+    phone_key VARCHAR(64) NULL,
     session MEDIUMTEXT NOT NULL,
     status VARCHAR(32) NOT NULL,
     expires_at BIGINT NULL,
@@ -32,7 +33,7 @@ export const tables = [
     pending_channel MEDIUMTEXT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    KEY ix_tg_user (user_id)
+    KEY ix_tg_user (user_id), KEY ix_tg_phone (phone_key,status,user_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   `CREATE TABLE IF NOT EXISTS bot_info (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -85,6 +86,7 @@ export const tables = [
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   `CREATE TABLE IF NOT EXISTS api_jobs (
     id CHAR(64) PRIMARY KEY, account_id CHAR(36) NOT NULL, user_id CHAR(36) NOT NULL,
+    project_id VARCHAR(36) NULL, workflow_id VARCHAR(36) NULL,
     phone_key CHAR(64) NOT NULL, auth_version BIGINT NOT NULL, path VARCHAR(512) NOT NULL,
     body MEDIUMTEXT NOT NULL, fingerprint CHAR(64) NOT NULL, status VARCHAR(16) NOT NULL,
     effect VARCHAR(32) NULL, result MEDIUMTEXT NULL, error JSON NULL,
@@ -95,6 +97,7 @@ export const tables = [
   `CREATE TABLE IF NOT EXISTS webhook_deliveries (
     bot_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, update_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     payload TEXT NOT NULL, status VARCHAR(16) NOT NULL, attempts INT NOT NULL DEFAULT 0,
+    remote_message_id VARCHAR(32) NULL,
     lease CHAR(36) NULL, lease_until BIGINT NOT NULL DEFAULT 0, next_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
     PRIMARY KEY(bot_id,update_id), KEY ix_deliveries_pending(status,next_at)

@@ -8,7 +8,7 @@ Landing Page 是客户提供的 HTTP(S) 地址；平台配置卡片及追踪链�
 
 平台注册生成 user_id；App 配置使用 app_config_id；个人 Telegram 账号使用 account_id；业务项目使用 project_id；流程使用 workflow_id，具体异步任务使用 job_id。
 
-所有身份归属从登录用户取得，普通请求不能指定 user_id。跨用户账号、App、项目与任务返回 404。Telegram 手机号只有完成认证后才登记正式绑定，未完成的发码不能占有别人的账号。重复登录优先复用已有 account_id。Telegram 数字 user_id 唯一绑定平台账号，username 只用于展示；当前没有跨用户转移接口。
+所有身份归属从登录用户取得，普通请求不能指定 user_id。跨用户账号、App、项目与任务返回 404。Telegram 手机号只有完成认证后才登记正式绑定，未完成的发码不能占有别人的账号。重复登录优先复用已有 account_id。Telegram 数字身份和正式手机号归属在同一 SQL 事务内绑定，失败不会留下部分绑定。暂时存储故障保留 identity_pending 和加密 Session，恢复后向 verify 提交 {}；此状态不能开通业务。账号手机号摘要通过索引查询，旧库需离线补齐 phone_key，未完成前拒绝新登录。Telegram 数字 user_id 唯一绑定平台账号，username 只用于展示；当前没有跨用户转移接口。
 
 Bot 访客与平台用户分别存储。test_user_ids 是允许访问测试 Bot 的 Telegram 数字 ID，不是平台 UUID 或 @username。生产 Bot 面向实际访客，平台用户的资源管理身份不作为生产访客白名单。
 
@@ -68,7 +68,7 @@ curl -X POST "$BASE_URL/v1/login/start" \
   -d "{\"app_config_id\":\"$APP_CONFIG_ID\",\"phone\":\"+447700900123\"}"
 ```
 
-保存 account_id，POST /v1/accounts/:id/verify 提交 code；status=password_required 时再提交 password。验证码和两步验证密码不会作为历史资料保存。再次 start 已授权账号返回原 account_id；需要重新认证时传 reauthenticate=true，重新接收验证码，资源归属保持。发码仍有每手机号 60 秒冷却。
+保存 account_id，POST /v1/accounts/:id/verify 提交 code；status=password_required 时再提交 password。本地绑定暂时失败返回 503 IDENTITY_PERSISTENCE_FAILED / retry_verify，稍后向相同 verify 提交 {}，无需再次使用验证码。验证码和两步验证密码不会作为历史资料保存。再次 start 已授权账号返回原 account_id；需要重新认证时传 reauthenticate=true，重新接收验证码，资源归属保持。发码仍有每手机号 60 秒冷却。
 
 GET /v1/onboarding 返回下一阶段、App 是否配置、已保存的认证状态、账号与项目列表；不会在线探测 Telegram 会话。
 
@@ -134,6 +134,8 @@ curl "$BASE_URL/v1/projects/$PROJECT_ID/workflows/$WORKFLOW_ID" \
 
 步骤数量由是否启用频道和帖子决定，completed_steps 不代表剩余时间。流程与步骤均在 DB，重启后继续执行，已有资源不会按流程重建。一个项目只允许一个活动流程。GET /v1/projects/:id/workflows 查看历史摘要；GET /v1/projects/:id 返回 active_workflow，可找回丢失的受理响应。
 
+新流程先执行 verify_webhook，再创建频道和发帖；已有流程保留原步骤顺序。底层任务与步骤 job_id 在同一事务提交，并保存 project_id/workflow_id；工作进程执行前检查关联和项目状态，关联缺失不会当作独立任务执行。流程租约每 30 秒续期，步骤和最终发布只允许当前有效持有者写入。流程重试只在接口事务中保存恢复意图，后台逐步恢复子任务，仍保留未知结果核对要求。
+
 ### 5. 测试并验收
 
 使用 test_user_ids 中的 Telegram 账号打开测试 Bot，点击 Start，确认文案/图片并点击卡片按钮，确认目标页面。非名单用户不收到测试卡片。必须存在本版本测试卡片发送成功和追踪链接访问记录，再确认：
@@ -154,6 +156,8 @@ curl -X POST "$BASE_URL/v1/projects/$PROJECT_ID/publish" \
 ```
 
 系统为已验收草稿创建并配置独立生产 Bot/Channel，完成检查后更新 published_version。生产 Bot、Token、Webhook Secret 与测试资源独立。之后发布新版本复用资源。生产卡片读取已发布配置，草稿和未完成发布不影响当前已发布卡片。
+
+频道帖子可能已经发出，但新版本签名链接只有在该版本存在成功生产流程记录后才能跳转；尚未发布或失败版本返回 403 / VERSION_NOT_PUBLISHED。Telegram 发帖与数据库发布提交不能组成一个远端事务，失败后不自动撤回已发帖子。回滚不撤销曾成功发布版本的链接资格，链接仍受用户/项目授权版本和有效期限制。
 
 GET /v1/projects/:id/versions 查看最近 100 个版本摘要。POST /v1/projects/:id/rollback，body={"version":1,"confirmed":true}，返回 202；只能回滚到成功发布过的生产版本，运行同样的配置/检查流程。回滚改变后续业务配置，不撤回已发送卡片或删除旧频道帖子。
 
@@ -213,7 +217,9 @@ DB 保存 Telegram App、账号身份、项目版本、流程步骤、访客资�
 npm run check
 npm test
 SECURITY_INTEGRATION=1 node --env-file=.env --test --test-concurrency=1 \
-  test/database.test.js test/admin.test.js test/security.test.js test/products.test.js test/upgrade.test.js
+  test/database.test.js test/admin.test.js test/security.test.js test/products.test.js test/production.test.js test/upgrade.test.js
 ```
 
 产品集成测试使用临时独立库，验证统一入口、归属隔离、双 Bot 发布、失败重试、版本回滚、指标、暂停/禁用、执行中停用、密码恢复和完整凭据轮换，结束删除自己的临时库。使用真实 SQL/Redis/HTTP 与本地 SMTP，Telegram 远端操作为模拟；真实 Telegram 与公网回调另行验收。SMTP 暂未配置时可以完成管理员及基础健康检查，普通用户注册/登录/密码恢复需要邮件投递。
+
+投递事件和 sent 状态在同一租约校验事务中提交。远端成功但本地事件写入失败时，可查询 deliveries/:update_id 的 message_id；有成功回执的 uncertain 投递可 POST 同路径 /reconcile 补齐事件，不重发。事件保留原投递时间，避免把较早测试投递计为新流程验收证据；无回执则需人工核对。

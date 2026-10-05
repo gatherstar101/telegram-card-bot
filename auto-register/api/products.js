@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Failure, errorDetails } from './errors.js';
-import { integer, credentials } from './security.js';
+import { integer, credentials,audit } from './security.js';
 import { landingConfig,botApi } from './conversion.js';
 import { workflowContext } from './execution-context.js';
 
@@ -50,10 +50,10 @@ export class Products {
       if(Number(n.n)>=await this.store.userLimit(user.id,'MAX_ACTIVE_WORKFLOWS_PER_USER',connection))throw new Failure(429,'开通并发达到配额','WORKFLOW_QUOTA','wait');
       const resource=await this.one("SELECT bot_id FROM project_resources WHERE project_id=? AND environment=? AND kind='bot'",[projectId,environment],connection);
       const pending=await this.one("SELECT COUNT(*) AS n FROM workflow_runs WHERE user_id=? AND status IN ('queued','running')",[user.id],connection);
-      if(!resource&&await this.store.botCount(user.id)+Number(pending.n)>=await this.store.userLimit(user.id,'MAX_BOTS_PER_USER',connection))throw new Failure(429,'Bot 配额不足','RESOURCE_QUOTA','review');
-      if(config.channel&&!await this.store.resource(projectId,environment,'channel')&&await this.store.channelCount(user.id)+Number(pending.n)>=await this.store.userLimit(user.id,'MAX_CHANNELS_PER_USER',connection))throw new Failure(429,'Channel 配额不足','RESOURCE_QUOTA','review');
+      if(!resource&&await this.store.botCount(user.id,connection)+Number(pending.n)>=await this.store.userLimit(user.id,'MAX_BOTS_PER_USER',connection))throw new Failure(429,'Bot 配额不足','RESOURCE_QUOTA','review');
+      if(config.channel&&!await this.store.resource(projectId,environment,'channel',connection)&&await this.store.channelCount(user.id,connection)+Number(pending.n)>=await this.store.userLimit(user.id,'MAX_CHANNELS_PER_USER',connection))throw new Failure(429,'Channel 配额不足','RESOURCE_QUOTA','review');
       await connection.execute('INSERT INTO workflow_runs(id,project_id,user_id,environment,version,status,business_epoch,project_epoch,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',[id,projectId,user.id,environment,version,'queued',epoch,locked.epoch,now,now,now]);
-      const steps=['create_bot','configure_landing','register_webhook',...(config.channel?['create_channel',...(config.channel.post_text?['publish_post']:[])]:[]),'verify_webhook',...(environment==='test'?['confirm_test']:[])];
+      const steps=['create_bot','configure_landing','register_webhook','verify_webhook',...(config.channel?['create_channel',...(config.channel.post_text?['publish_post']:[])]:[]),...(environment==='test'?['confirm_test']:[])];
       for(let position=0;position<steps.length;position++)await connection.execute('INSERT INTO workflow_steps(workflow_id,position,code,status) VALUES(?,?,?,?)',[id,position,steps[position],'queued']);
       await connection.execute('UPDATE project_info SET active_workflow=?,updated_at=? WHERE id=?',[id,now,projectId]);
     });
@@ -139,18 +139,21 @@ export class Products {
       if(action==='cancel'&&['succeeded','cancelled'].includes(run.status))throw new Failure(409,'流程已结束');
       if(action==='retry'&&!['failed','needs_reconciliation','suspended'].includes(run.status))throw new Failure(409,'流程状态已变化');
       await connection.execute('UPDATE workflow_runs SET status=?,business_epoch=?,project_epoch=?,next_at=?,updated_at=? WHERE id=?',[action==='retry'?'queued':'cancelled',epoch,locked.epoch,Date.now(),Date.now(),id]);
-      if(action==='retry')await connection.execute('UPDATE project_info SET active_workflow=? WHERE id=?',[id,project.id]);
+      if(action==='retry'){
+        await connection.execute('UPDATE project_info SET active_workflow=? WHERE id=?',[id,project.id]);
+        await connection.execute("UPDATE workflow_steps SET status='queued',error=NULL WHERE workflow_id=? AND status<>'succeeded'",[id]);
+      }
       else await connection.execute('UPDATE project_info SET active_workflow=NULL WHERE id=? AND active_workflow=?',[project.id,id]);
       if(action==='cancel')await connection.execute("UPDATE api_jobs SET status='cancelled',updated_at=? WHERE status='queued' AND id IN (SELECT job_id FROM workflow_steps WHERE workflow_id=?)",[Date.now(),id]);
     });
-    if(action==='retry'){for(const step of await this.rows("SELECT job_id FROM workflow_steps WHERE workflow_id=? AND status<>'succeeded' AND job_id IS NOT NULL",[id])){const job=await this.jobs.get(step.job_id,user,project.account_id);if(['failed','cancelled','uncertain'].includes(job.status))await this.jobs.retry(job.id,user,project.account_id);}}
     return this.workflowView(user,project.id,id);
   }
   async claim() {return this.store.transaction(async connection=>{const now=Date.now();const run=await this.one("SELECT * FROM workflow_runs WHERE status IN ('queued','running') AND next_at<=? AND lease_until<=? ORDER BY next_at LIMIT 1 FOR UPDATE SKIP LOCKED",[now,now],connection);if(!run)return null;const lease=randomUUID();await connection.execute("UPDATE workflow_runs SET status='running',lease=?,lease_until=?,updated_at=? WHERE id=?",[lease,now+120000,now,run.id]);return {...run,lease};});}
-  async updateRun(run,status) {await this.store.pool.execute("UPDATE workflow_runs SET status=?,lease=NULL,lease_until=0,next_at=?,updated_at=? WHERE id=? AND lease=? AND status='running'",[status,Date.now()+1000,Date.now(),run.id,run.lease]);}
+  async updateRun(run,status) {await this.store.pool.execute("UPDATE workflow_runs SET status=?,lease=NULL,lease_until=0,next_at=?,updated_at=? WHERE id=? AND lease=? AND status='running' AND lease_until>?",[status,Date.now()+1000,Date.now(),run.id,run.lease,Date.now()]);}
   async runOnce() {
     if(Date.now()-this.lastCleanup>3600000){await this.store.cleanProductData(integer(this.env,'BUSINESS_EVENT_RETENTION_DAYS',90,1,3650),integer(this.env,'RAW_UPDATE_RETENTION_DAYS',7,0,90));this.lastCleanup=Date.now();}
     const run=await this.claim();if(!run)return;
+    const heartbeat=setInterval(()=>this.store.pool.execute("UPDATE workflow_runs SET lease_until=? WHERE id=? AND lease=? AND status='running' AND lease_until>?",[Date.now()+120000,run.id,run.lease,Date.now()]).catch(()=>audit('workflow_lease_error',{workflow_id:run.id})),30000);heartbeat.unref();
     try{
       await this.store.assertBusiness(run.user_id,run.business_epoch);
       const project=await this.store.project(run.user_id,run.project_id);if(project.status!=='active'||project.active_workflow!==run.id||Number(project.epoch)!==Number(run.project_epoch))throw new Failure(409,'项目已停止','PROJECT_INACTIVE','review');
@@ -158,23 +161,32 @@ export class Products {
       const step=await this.one("SELECT * FROM workflow_steps WHERE workflow_id=? AND status<>'succeeded' ORDER BY position LIMIT 1",[run.id]);
       if(!step){await this.complete(run,project);return;}
       if(step.code==='confirm_test'){await this.updateRun(run,'waiting_test');return;}
-      await this.store.pool.execute("UPDATE workflow_steps SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error=NULL WHERE workflow_id=? AND position=?",[Date.now(),run.id,step.position]);
+      const owned=" AND EXISTS (SELECT 1 FROM workflow_runs r WHERE r.id=workflow_steps.workflow_id AND r.lease=? AND r.status='running' AND r.lease_until>?)";
+      const [started]=await this.store.pool.execute("UPDATE workflow_steps SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error=NULL WHERE workflow_id=? AND position=?"+owned,[Date.now(),run.id,step.position,run.lease,Date.now()]);
+      if(!started.affectedRows)throw new Failure(409,'流程租约已失效','WORKFLOW_LEASE_EXPIRED','retry');
       const result=await workflowContext.run(run,()=>this.executeStep(run,project,config,user,step));
       if(result==='pending'){await this.updateRun(run,'running');return;}
-      await this.store.pool.execute("UPDATE workflow_steps SET status='succeeded',completed_at=? WHERE workflow_id=? AND position=?",[Date.now(),run.id,step.position]);
+      const [completed]=await this.store.pool.execute("UPDATE workflow_steps SET status='succeeded',completed_at=? WHERE workflow_id=? AND position=?"+owned,[Date.now(),run.id,step.position,run.lease,Date.now()]);
+      if(!completed.affectedRows)throw new Failure(409,'流程租约已失效','WORKFLOW_LEASE_EXPIRED','retry');
       await this.updateRun(run,'running');
     }catch(error){
       const status=['USER_DISABLED','BUSINESS_REVOKED','PROJECT_INACTIVE'].includes(error.code)?'suspended':error.code==='REMOTE_RESULT_UNKNOWN'?'needs_reconciliation':'failed';
       const details=errorDetails(error,error.status||502);
-      await this.store.pool.execute("UPDATE workflow_steps SET status=?,error=? WHERE workflow_id=? AND status='running'",[status,JSON.stringify({...details,message:error.status?error.message:'操作失败，请根据请求记录排查'}),run.id]);
+      await this.store.pool.execute("UPDATE workflow_steps SET status=?,error=? WHERE workflow_id=? AND status='running' AND EXISTS (SELECT 1 FROM workflow_runs r WHERE r.id=workflow_steps.workflow_id AND r.lease=? AND r.status='running' AND r.lease_until>?)",[status,JSON.stringify({...details,message:error.status?error.message:'操作失败，请根据请求记录排查'}),run.id,run.lease,Date.now()]);
       await this.updateRun(run,status);
-    }
+    }finally{clearInterval(heartbeat);}
   }
   async executeStep(run,project,config,user,step) {
     const base=`/v1/accounts/${project.account_id}`;const bot=config[`${run.environment}_bot`];
     const task=async(path,body)=>{
       let job=step.job_id?await this.jobs.get(step.job_id,user,project.account_id):null;
-      if(!job){const accepted=await this.jobs.enqueue(path,body,user,project.account_id);await this.store.pool.execute('UPDATE workflow_steps SET job_id=? WHERE workflow_id=? AND position=?',[accepted.job_id,run.id,step.position]);job=await this.jobs.get(accepted.job_id,user,project.account_id);}
+      if(!job){const accepted=await this.jobs.enqueue(path,body,user,project.account_id,{project_id:project.id,workflow_id:run.id,position:step.position,lease:run.lease});job=await this.jobs.get(accepted.job_id,user,project.account_id);}
+      // Retry only after explicit workflow retry reset this linked step to queued.
+      // The API transaction never exposes a runnable workflow before this intent.
+      if(step.status==='queued'&&step.job_id&&['failed','cancelled','uncertain'].includes(job.status)){
+        try{await this.jobs.retry(job.id,user,project.account_id);}catch(error){if(job.status==='uncertain'&&error.status===409)throw new Failure(409,'远端结果不确定，请先核对任务','REMOTE_RESULT_UNKNOWN','reconcile');throw error;}
+        job=await this.jobs.get(job.id,user,project.account_id);
+      }
       if(['queued','running'].includes(job.status))return false;
       if(job.status==='uncertain')throw new Failure(409,'远端结果不确定，请先核对任务','REMOTE_RESULT_UNKNOWN','reconcile');
       if(['failed','cancelled'].includes(job.status))throw new Failure(502,'步骤任务失败，请检查任务后重试流程','STEP_FAILED','review_and_retry');
@@ -208,7 +220,10 @@ export class Products {
   async complete(run,project) {
     await this.store.transaction(async connection=>{
       await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[run.user_id]);if(await this.store.businessState(run.user_id,connection)!==Number(run.business_epoch))throw new Failure(409,'业务授权已变更','BUSINESS_REVOKED');
-      const locked=await this.one('SELECT * FROM project_info WHERE id=? FOR UPDATE',[project.id],connection);if(locked.active_workflow!==run.id||locked.status!=='active')throw new Failure(409,'项目已停止','PROJECT_INACTIVE');
+      const locked=await this.one('SELECT * FROM project_info WHERE id=? FOR UPDATE',[project.id],connection);if(locked.active_workflow!==run.id||locked.status!=='active'||Number(locked.epoch)!==Number(run.project_epoch))throw new Failure(409,'项目已停止','PROJECT_INACTIVE');
+      const current=await this.one('SELECT status,lease,lease_until FROM workflow_runs WHERE id=? FOR UPDATE',[run.id],connection);
+      if(current?.status!=='running'||current.lease!==run.lease||Number(current.lease_until)<=Date.now())throw new Failure(409,'流程租约已失效','WORKFLOW_LEASE_EXPIRED','retry');
+      if(await this.one("SELECT position FROM workflow_steps WHERE workflow_id=? AND status<>'succeeded' LIMIT 1",[run.id],connection))throw new Failure(409,'流程步骤尚未完成');
       if(run.environment==='production')await connection.execute('UPDATE project_info SET published_version=? WHERE id=?',[run.version,project.id]);
       await connection.execute('UPDATE project_info SET active_workflow=NULL WHERE id=?',[project.id]);
       await connection.execute("UPDATE workflow_runs SET status='succeeded',lease=NULL,lease_until=0,updated_at=? WHERE id=? AND lease=?",[Date.now(),run.id,run.lease]);

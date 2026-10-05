@@ -60,6 +60,7 @@ async function route(method, path, body, user) {
       const id = store.claimPhone?await store.claimPhone(user.id,phone,randomUUID()):randomUUID();
       const previous=await store.getAccount(id);
       if(previous?.status==='authorized'&&body.reauthenticate!==true)return {account_id:id,status:'authorized',delivery:null};
+      if(previous?.status==='identity_pending'&&body.reauthenticate!==true)return {account_id:id,status:'identity_pending',delivery:null,next_action:'retry_verify'};
       const state = { user_id: user.id, api_id, api_hash, phone, status: 'code_required' };
       const delivery = await connected(state, async client => {
         const result = await client.sendCode({ apiId: api_id, apiHash: api_hash }, phone);
@@ -116,13 +117,14 @@ async function route(method, path, body, user) {
     if (method === 'POST' && suffix === 'verify') {
       if(state.status==='revoked')throw new Failure(401,'Telegram 登录已撤销');
       if (state.status === 'authorized') return { account_id: id, status: state.status };
-      if (Date.now() > state.expires_at) throw new Failure(410, '登录流程过期，请重新发送验证码');
+      if(state.status==='identity_conflict')throw new Failure(409,'Telegram 身份绑定冲突，请联系管理员','IDENTITY_CONFLICT','contact_administrator');
+      if (state.status!=='identity_pending'&&Date.now() > state.expires_at) throw new Failure(410, '登录流程过期，请重新发送验证码');
       await connected(state, async client => {
         if (state.status === 'code_required') {
           try {
             const result = await client.invoke(new Api.auth.SignIn({ phoneNumber: state.phone, phoneCodeHash: state.phone_code_hash, phoneCode: requireValue(body.code, 'code') }));
             if (result instanceof Api.auth.AuthorizationSignUpRequired) throw new Failure(422, '需要已注册的 Telegram 用户账号');
-            state.status = 'authorized';
+            state.status = 'identity_pending';
           } catch (e) {
             if (e.errorMessage !== 'SESSION_PASSWORD_NEEDED') throw e;
             state.status = 'password_required';
@@ -131,12 +133,17 @@ async function route(method, path, body, user) {
         if (state.status === 'password_required' && body.password) {
           const settings = await client.invoke(new Api.account.GetPassword());
           await client.invoke(new Api.auth.CheckPassword({ password: await computeCheck(settings, requireValue(body.password, 'password')) }));
-          state.status = 'authorized';
+          state.status = 'identity_pending';
         }
-        if (state.status === 'authorized') {
+        if (state.status === 'identity_pending') {
           const me=await client.getMe();
-          if (me.bot) throw new Failure(422, '必须使用个人账号');
-          if(store.recordIdentity)try{await store.recordIdentity(user.id,id,me,state.phone);}catch(error){state.status='identity_conflict';state.session='';throw error;}
+          if (me.bot){state.status='identity_conflict';state.session='';throw new Failure(422, '必须使用个人账号');}
+          if(store.recordIdentity)try{await store.recordIdentity(user.id,id,me,state.phone);}catch(error){
+            if(error.code==='IDENTITY_CONFLICT'){state.status='identity_conflict';state.session='';throw error;}
+            if(error instanceof Failure)throw error;
+            throw new Failure(503,'身份绑定暂时无法保存，请重试 verify','IDENTITY_PERSISTENCE_FAILED','retry_verify');
+          }
+          state.status='authorized';
           delete state.phone_code_hash;
           delete state.expires_at;
         }
@@ -218,7 +225,7 @@ async function route(method, path, body, user) {
     }
     throw new Failure(404, '接口不存在');
   } finally {
-    try { if(state&&JSON.stringify(state)!==snapshot)await save(id,state); }
+    try { if(state?.status==='identity_conflict')state.session='';if(state&&JSON.stringify(state)!==snapshot)await save(id,state); }
     finally {busy.delete(initial.phone);await release?.();}
   }
 }

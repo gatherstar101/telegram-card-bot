@@ -11,7 +11,7 @@ export class Jobs {
   constructor(store,auth,env,execute) {this.store=store;this.auth=auth;this.env=env;this.execute=execute;this.crypt=credentials(env);this.queue=queueStore(store,'api_jobs','running');this.lastCleanup=0;}
   view(row){if(!row)throw new Failure(404,'任务不存在');return {job_id:row.id,account_id:row.account_id,status:row.status,created_at:Number(row.created_at),updated_at:Number(row.updated_at),...(row.result?{result:JSON.parse(this.crypt.open(row.result,`job:${row.id}:result`))}:{}),...(row.error?{error:parse(row.error)}:{})};}
   async get(id,user,account){const row=await this.queue.one('SELECT * FROM api_jobs WHERE id=? AND user_id=? AND account_id=?',[id,user.id,account]);if(!row)throw new Failure(404,'任务不存在');return row;}
-  async enqueue(path,body,user,account) {
+  async enqueue(path,body,user,account,binding=null) {
     const allowed=/\/bots$/.test(path)?['name','username','request_key']:/\/channels$/.test(path)?['title','about','bot_username','request_key']:/\/posts$/.test(path)?['text','request_key']:/\/channels\/[^/]+\/reconcile$/.test(path)?['channel_id','access_hash','request_key']:['request_key'];
     if(Object.keys(body).some(k=>!allowed.includes(k))||Object.values(body).some(v=>typeof v!=='string'))throw new Failure(400,'任务参数必须为受支持的字符串字段');
     body={...body};
@@ -22,15 +22,38 @@ export class Jobs {
     if(typeof key!=='string'||! /^[A-Za-z0-9_-]{1,64}$/.test(key))throw new Failure(400,'需要 1–64 位 request_key');
     const state=await this.store.getAccount(account);if(!state||state.user_id!==user.id)throw new Failure(404,'账号不存在');if(state.status!=='authorized')throw new Failure(401,'请先完成 Telegram 登录');
     const phoneKey=digest(state.phone);const id=digest(`${account}:${path}:${key}`);const canonical=JSON.stringify(Object.fromEntries(Object.entries(body).sort(([a],[b])=>a.localeCompare(b))));const fingerprint=digest(canonical);
-    const result=await withLease(this.auth.cache,`${this.env.REDIS_KEY_PREFIX||'telegram-bot:'}enqueue:${phoneKey}`,async()=>{
-      const existing=await this.queue.one('SELECT * FROM api_jobs WHERE id=?',[id]);
-      if(existing){if(existing.fingerprint!==fingerprint)throw new Failure(409,'request_key 已用于不同参数');return this.view(existing);}
-      const count=await this.queue.one("SELECT COUNT(*) AS n FROM api_jobs WHERE phone_key=? AND status IN ('queued','running')",[phoneKey]);if(Number(count.n)>=integer(this.env,'JOB_QUEUE_LIMIT',20,1,100))throw new Failure(429,'账号任务队列已满');
-      if(/\/bots$|\/channels$/.test(path)&&Number((await this.queue.one("SELECT COUNT(*) AS n FROM api_jobs WHERE phone_key=? AND status='uncertain'",[phoneKey])).n))throw new Failure(409,'请先核对结果不确定的任务');
-      const now=Date.now();await this.store.pool.execute('INSERT INTO api_jobs(id,account_id,user_id,phone_key,auth_version,path,body,fingerprint,status,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[id,account,user.id,phoneKey,user.auth_version||0,path,this.crypt.seal(canonical,`job:${id}:body`),fingerprint,'queued',now,now,now]);
-      audit('job_enqueued',{job_id:id,user_id:user.id});return this.view(await this.queue.one('SELECT * FROM api_jobs WHERE id=?',[id]));
-    },30);
-    if(result.busy)throw new Failure(409,'任务提交正在处理，请稍后重试');return result.value;
+    const result=await withLease(this.auth.cache,`${this.env.REDIS_KEY_PREFIX||'telegram-bot:'}enqueue:${phoneKey}`,()=>this.store.transaction(async connection=>{
+      const one=async(sql,args=[])=>(await connection.execute(sql,args))[0][0]||null;
+      await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[user.id]);
+      const epoch=await this.store.businessState(user.id,connection);
+      const security=await one('SELECT auth_version FROM user_security WHERE user_id=?',[user.id]);
+      if(Number(security?.auth_version||0)!==Number(user.auth_version||0))throw new Failure(401,'登录状态已撤销','AUTH_REVOKED');
+      if(binding){
+        const project=await one('SELECT * FROM project_info WHERE id=? AND user_id=? FOR UPDATE',[binding.project_id,user.id]);
+        const run=await one('SELECT * FROM workflow_runs WHERE id=? AND project_id=? AND user_id=? FOR UPDATE',[binding.workflow_id,binding.project_id,user.id]);
+        if(!project||project.account_id!==account||project.status!=='active'||project.active_workflow!==run?.id||run?.status!=='running'||Number(run.business_epoch)!==epoch||Number(project.epoch)!==Number(run.project_epoch))throw new Failure(409,'项目流程已停止','PROJECT_INACTIVE','review');
+        if(run.lease!==binding.lease||Number(run.lease_until)<=Date.now())throw new Failure(409,'流程租约已失效','WORKFLOW_LEASE_EXPIRED','retry');
+        const step=await one('SELECT job_id,status FROM workflow_steps WHERE workflow_id=? AND position=? FOR UPDATE',[run.id,binding.position]);
+        if(!step||step.status!=='running'||step.job_id&&step.job_id!==id)throw new Failure(409,'流程步骤状态已改变');
+      }
+      let row=await one('SELECT * FROM api_jobs WHERE id=? FOR UPDATE',[id]);
+      if(row){
+        if(row.user_id!==user.id||row.fingerprint!==fingerprint)throw new Failure(409,'request_key 已用于不同参数');
+        if(binding&&row.project_id&&row.project_id!==binding.project_id)throw new Failure(409,'任务属于其他项目');
+        if(binding&&row.workflow_id!==binding.workflow_id&&row.status==='running')throw new Failure(409,'任务已由其他流程执行');
+      }else{
+        const count=await one("SELECT COUNT(*) AS n FROM api_jobs WHERE phone_key=? AND status IN ('queued','running')",[phoneKey]);if(Number(count.n)>=integer(this.env,'JOB_QUEUE_LIMIT',20,1,100))throw new Failure(429,'账号任务队列已满');
+        if(/\/bots$|\/channels$/.test(path)&&Number((await one("SELECT COUNT(*) AS n FROM api_jobs WHERE phone_key=? AND status='uncertain'",[phoneKey])).n))throw new Failure(409,'请先核对结果不确定的任务');
+        const now=Date.now();await connection.execute('INSERT INTO api_jobs(id,account_id,user_id,project_id,workflow_id,phone_key,auth_version,path,body,fingerprint,status,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[id,account,user.id,binding?.project_id||null,binding?.workflow_id||null,phoneKey,user.auth_version||0,path,this.crypt.seal(canonical,`job:${id}:body`),fingerprint,'queued',now,now,now]);
+        row=await one('SELECT * FROM api_jobs WHERE id=?',[id]);
+      }
+      if(binding){
+        await connection.execute('UPDATE api_jobs SET project_id=?,workflow_id=? WHERE id=?',[binding.project_id,binding.workflow_id,id]);
+        await connection.execute('UPDATE workflow_steps SET job_id=? WHERE workflow_id=? AND position=?',[id,binding.workflow_id,binding.position]);
+      }
+      return this.view(row);
+    }),30);
+    if(result.busy)throw new Failure(409,'任务提交正在处理，请稍后重试');audit('job_enqueued',{job_id:id,user_id:user.id});return result.value;
   }
   async checkpoint(effect){const row=jobContext.getStore();if(row){if(this.store.assertTask)await this.store.assertTask(row.id,row.user_id);if(!await this.queue.update(row,{effect,updated_at:Date.now()},true))throw new Failure(409,'任务租约已失效');row.effect=effect;}}
   async known(row){

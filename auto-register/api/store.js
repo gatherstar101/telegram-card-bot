@@ -1,30 +1,18 @@
 import { createDatabase,conflict } from './database.js';
-import { postgresTables } from './postgres-schema.js';
-import { tables } from './schema.js';
 import { credentials } from './security.js';
 import { Failure } from './errors.js';
 import { randomUUID } from 'node:crypto';
 import { publicUser } from './admin.js';
-import { productTables } from './product-schema.js';
 import { installProductStore } from './product-store.js';
+import { initializeSchema } from './migrations.js';
+import { digest } from './auth.js';
 
 export async function createStore(env = process.env) {
   const crypt=credentials(env);
   const fields=['api_hash','phone','session','phone_code_hash','pending_bot','pending_channel'];
   const {pool,type,database}=await createDatabase(env);
   try {
-    for (const sql of type==='postgresql'?postgresTables:tables) await pool.execute(sql);
-    for (const entry of productTables(type)) {
-      if(typeof entry==='string')await pool.execute(entry);
-      else {const [indexes]=await pool.execute('SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME=?',[database,entry.table,entry.name]);if(!indexes.length)try{await pool.execute(entry.sql);}catch(error){if(error.code!=='ER_DUP_KEYNAME')throw error;}}
-    }
-    for(const [table,column,definition] of [['project_info','epoch','BIGINT NOT NULL DEFAULT 0'],['project_resources','version','INT NOT NULL DEFAULT 1'],['workflow_runs','project_epoch','BIGINT NOT NULL DEFAULT 0'],['business_events','version','INT NULL']]) {
-      const [columns]=await pool.execute('SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=? AND column_name=?',[type==='mysql'?database:'public',table,column]);if(!columns.length)await pool.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-    }
-    if(type==='mysql')for(const [table,column,definition] of [['tg_info','api_hash','TEXT NOT NULL'],['tg_info','phone','TEXT NOT NULL'],['tg_info','phone_code_hash','TEXT NULL'],['tg_info','pending_bot','MEDIUMTEXT NULL'],['tg_info','pending_channel','MEDIUMTEXT NULL'],['bot_info','token','TEXT NOT NULL'],['bot_info','webhook_secret','TEXT NULL']]) {
-      const [rows]=await pool.execute('SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?',[database,table,column]);
-      if(!['text','mediumtext','longtext'].includes(rows[0]?.DATA_TYPE))await pool.query(`ALTER TABLE ${table} MODIFY ${column} ${definition}`);
-    }
+    await initializeSchema({pool,type,database},env);
   } catch(error) {await pool.end();throw error;}
   const one = async (sql,args) => {const [rows]=await pool.execute(sql,args);return rows[0] || null;};
   const json = value => typeof value === 'string' ? JSON.parse(value) : value;
@@ -50,7 +38,7 @@ export async function createStore(env = process.env) {
     if(!users.length||!admins.length||Boolean(Number(security[0]?.disabled))||Number(security[0]?.auth_version||0)!==context.actor_auth_version)throw new Failure(401,'管理员登录状态已撤销');
   };
   const store = {
-    pool, transaction, type, ready:()=>pool.execute('SELECT 1'),
+    pool, transaction, type, ready:async()=>{await pool.execute('SELECT 1');if(await one('SELECT account_id FROM tg_info WHERE phone_key IS NULL LIMIT 1',[]))throw new Failure(503,'历史账号手机号索引未补齐，请运行 npm run backfill:phones','PHONE_INDEX_NOT_READY');},
     appendAudit,
     async initializeAdmin(user) {
       const initialize=()=>transaction(async connection=>{
@@ -119,8 +107,8 @@ export async function createStore(env = process.env) {
       await appendAudit({...context,status:200,changes:{limits:{before:old.length?json(old[0].config):{},after:config}}},connection);return {ok:true,overrides:config};
     });},
     async accountCount(id){return Number((await one("SELECT COUNT(*) AS n FROM tg_info WHERE user_id=? AND (status NOT IN ('code_required','password_required') OR expires_at>=?)",[id,Date.now()])).n);},
-    botCount:async id=>Number((await one('SELECT COUNT(*) AS n FROM bot_info WHERE user_id=?',[id])).n),
-    channelCount:async id=>Number((await one('SELECT COUNT(*) AS n FROM channel_info WHERE user_id=?',[id])).n),
+    botCount:async(id,connection=pool)=>Number((await connection.execute('SELECT COUNT(*) AS n FROM bot_info WHERE user_id=?',[id]))[0][0].n),
+    channelCount:async(id,connection=pool)=>Number((await connection.execute('SELECT COUNT(*) AS n FROM channel_info WHERE user_id=?',[id]))[0][0].n),
     channelFailed:(id,key)=>pool.execute("DELETE FROM channel_info WHERE account_id=? AND request_key=? AND status='creating'",[id,key]),
     updateToken:async(id,username,token)=>pool.execute(`UPDATE bot_info SET updated_at=CURRENT_TIMESTAMP,token=? WHERE account_id=? AND ${insensitive('username')}`,[crypt.seal(token,`bot:${token.split(':')[0]}:token`),id,username]),
     userByEmail: async email => {const row=await one(userQuery+` WHERE ${insensitive('u.email')}`,[email]);return row&&{...row,disabled:Boolean(Number(row.disabled)),auth_version:Number(row.auth_version)};},
@@ -140,9 +128,9 @@ export async function createStore(env = process.env) {
       // user_id is immutable on update. Callers enforce ownership before use.
       const existing=await one('SELECT user_id FROM tg_info WHERE account_id=?',[id]);
       if(existing && existing.user_id!==state.user_id)throw new Error('Account ownership mismatch');
-      await pool.execute(`INSERT INTO tg_info (account_id,user_id,api_id,api_hash,phone,session,status,expires_at,pending_bot,pending_channel,phone_code_hash)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?) ${conflict(type,'tg_info',['account_id'],['api_id','api_hash','phone','session','status','expires_at','pending_bot','pending_channel','phone_code_hash'],['updated_at=CURRENT_TIMESTAMP'])}`,
-        [id,state.user_id,state.api_id,crypt.seal(state.api_hash,`tg:${id}:api_hash`),crypt.seal(state.phone,`tg:${id}:phone`),crypt.seal(state.session||'',`tg:${id}:session`),state.status,state.expires_at??null,crypt.seal(state.pending_bot?JSON.stringify(state.pending_bot):null,`tg:${id}:pending_bot`),crypt.seal(state.pending_channel?JSON.stringify(state.pending_channel):null,`tg:${id}:pending_channel`),crypt.seal(state.phone_code_hash??null,`tg:${id}:phone_code_hash`)]);
+      await pool.execute(`INSERT INTO tg_info (account_id,user_id,api_id,api_hash,phone,phone_key,session,status,expires_at,pending_bot,pending_channel,phone_code_hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ${conflict(type,'tg_info',['account_id'],['api_id','api_hash','phone','phone_key','session','status','expires_at','pending_bot','pending_channel','phone_code_hash'],['updated_at=CURRENT_TIMESTAMP'])}`,
+        [id,state.user_id,state.api_id,crypt.seal(state.api_hash,`tg:${id}:api_hash`),crypt.seal(state.phone,`tg:${id}:phone`),digest(state.phone),crypt.seal(state.session||'',`tg:${id}:session`),state.status,state.expires_at??null,crypt.seal(state.pending_bot?JSON.stringify(state.pending_bot):null,`tg:${id}:pending_bot`),crypt.seal(state.pending_channel?JSON.stringify(state.pending_channel):null,`tg:${id}:pending_channel`),crypt.seal(state.phone_code_hash??null,`tg:${id}:phone_code_hash`)]);
     },
     getLanding: async (id,user) => {const row=await one(`SELECT telegram_bot_id,username AS bot_username,account_id,customer_id,landing_url,card_text,card_image,button_text,webhook_secret,webhook_url
       FROM bot_info WHERE account_id=? AND ${insensitive('username')} AND customer_id IS NOT NULL`,[id,user]);if(row)row.webhook_secret=crypt.open(row.webhook_secret,`bot:${row.telegram_bot_id}:webhook_secret`);return row;},

@@ -1,4 +1,4 @@
--- Administrator roles and persistent operation audit.
+-- Database is supplied by the caller; schema is non-destructive.
 CREATE TABLE IF NOT EXISTS user_admins (
     user_id VARCHAR(36) PRIMARY KEY
   );
@@ -16,9 +16,6 @@ CREATE INDEX IF NOT EXISTS ix_audit_target ON audit_logs(target_id,id);
 
 CREATE INDEX IF NOT EXISTS ix_audit_time ON audit_logs(completed_at);
 
--- PostgreSQL 16+. Connect to the DB_DATABASE target before running.
--- Database creation is managed by the service or administrator, outside a transaction.
-
 CREATE TABLE IF NOT EXISTS user_info (
     id VARCHAR(36) PRIMARY KEY, email VARCHAR(254) NOT NULL,
     password_hash VARCHAR(256) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -28,7 +25,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_user_email ON user_info(LOWER(email));
 
 CREATE TABLE IF NOT EXISTS tg_info (
     account_id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) NOT NULL,
-    api_id BIGINT NOT NULL, api_hash TEXT NOT NULL, phone TEXT NOT NULL,
+    api_id BIGINT NOT NULL, api_hash TEXT NOT NULL, phone TEXT NOT NULL, phone_key VARCHAR(64),
     session TEXT NOT NULL, status VARCHAR(32) NOT NULL, expires_at BIGINT,
     phone_code_hash TEXT, pending_bot TEXT, pending_channel TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -81,6 +78,7 @@ CREATE TABLE IF NOT EXISTS channel_posts (
 
 CREATE TABLE IF NOT EXISTS api_jobs (
     id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(36) NOT NULL, user_id VARCHAR(36) NOT NULL,
+    project_id VARCHAR(36), workflow_id VARCHAR(36),
     phone_key VARCHAR(64) NOT NULL, auth_version BIGINT NOT NULL, path VARCHAR(512) NOT NULL,
     body TEXT NOT NULL, fingerprint VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL,
     effect VARCHAR(32), result TEXT, error JSONB, lease VARCHAR(36),
@@ -95,13 +93,13 @@ CREATE INDEX IF NOT EXISTS ix_jobs_phone ON api_jobs(phone_key,status);
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     bot_id VARCHAR(32) NOT NULL, update_id VARCHAR(32) NOT NULL, payload TEXT NOT NULL,
     status VARCHAR(16) NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+    remote_message_id VARCHAR(32),
     lease VARCHAR(36), lease_until BIGINT NOT NULL DEFAULT 0, next_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY(bot_id,update_id)
   );
 
 CREATE INDEX IF NOT EXISTS ix_deliveries_pending ON webhook_deliveries(status,next_at);
 
--- Product schema additions
 CREATE TABLE IF NOT EXISTS telegram_apps (id VARCHAR(36) PRIMARY KEY,user_id VARCHAR(36) NOT NULL,name VARCHAR(64) NOT NULL,api_id BIGINT NOT NULL,api_hash TEXT NOT NULL,version INT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS telegram_identities (telegram_user_id VARCHAR(32) PRIMARY KEY,user_id VARCHAR(36) NOT NULL,account_id VARCHAR(36) NOT NULL UNIQUE,profile TEXT NOT NULL,updated_at BIGINT NOT NULL);
@@ -138,6 +136,12 @@ CREATE INDEX IF NOT EXISTS ix_workflows_pending ON workflow_runs (status,next_at
 
 CREATE INDEX IF NOT EXISTS ix_events_user ON business_events (user_id,occurred_at);
 
+CREATE INDEX IF NOT EXISTS ix_workflows_release ON workflow_runs (project_id,environment,version,status);
+
+CREATE INDEX IF NOT EXISTS ix_steps_job ON workflow_steps (job_id);
+
 CREATE INDEX IF NOT EXISTS ix_events_project ON business_events (project_id,occurred_at);
 
 CREATE INDEX IF NOT EXISTS ix_dispatch_user ON business_dispatches (user_id,status);
+
+CREATE INDEX IF NOT EXISTS ix_tg_phone ON tg_info (phone_key,status,user_id);

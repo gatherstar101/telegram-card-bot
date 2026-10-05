@@ -21,6 +21,7 @@ export function productTables(type) {
   for (const [name, table, columns] of [
     ['ix_apps_user','telegram_apps','user_id,id'],['ix_projects_user','project_info','user_id,id'],
     ['ix_workflows_pending','workflow_runs','status,next_at'],['ix_events_user','business_events','user_id,occurred_at'],
+    ['ix_workflows_release','workflow_runs','project_id,environment,version,status'],['ix_steps_job','workflow_steps','job_id'],
     ['ix_events_project','business_events','project_id,occurred_at'],['ix_dispatch_user','business_dispatches','user_id,status'],
   ]) result.push(type === 'mysql' ? {name, table, sql:`CREATE INDEX ${name} ON ${table} (${columns})`} : `CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})`);
   return result;

@@ -14,6 +14,9 @@ export function databaseConfig(input) {
   const sslMode=env.DB_SSL_MODE||'disable';
   if(!['disable','verify-full'].includes(sslMode))throw new Error('DB_SSL_MODE 必须为 disable 或 verify-full');
   if(env.DB_AUTO_CREATE_DATABASE!==undefined&&!['true','false'].includes(env.DB_AUTO_CREATE_DATABASE))throw new Error('DB_AUTO_CREATE_DATABASE 必须为 true 或 false');
+  if(env.DB_SCHEMA_INIT!==undefined&&!['true','false'].includes(env.DB_SCHEMA_INIT))throw new Error('DB_SCHEMA_INIT 必须为 true 或 false');
+  if(env.DB_SCHEMA_INIT==='false'&&env.DB_AUTO_CREATE_DATABASE!=='false')throw new Error('DB_SCHEMA_INIT=false 时需要 DB_AUTO_CREATE_DATABASE=false');
+  integer(env,'DB_SCHEMA_LOCK_TIMEOUT_SECONDS',60,1,300);
   const maintenance=env.DB_MAINTENANCE_DATABASE||'postgres';
   if(type==='postgresql'&&!/^[A-Za-z0-9_]{1,63}$/.test(maintenance))throw new Error('DB_MAINTENANCE_DATABASE 名称无效');
   return {type,database,autoCreate:env.DB_AUTO_CREATE_DATABASE!=='false',maintenance,poolSize:integer(env,'DB_POOL_SIZE',10,1,100),timeout:integer(env,'DB_CONNECT_TIMEOUT_MS',5000,1000,30000),

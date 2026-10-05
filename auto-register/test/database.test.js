@@ -7,6 +7,7 @@ import {createStore} from '../api/store.js';
 import {postgresTables} from '../api/postgres-schema.js';
 import {tables} from '../api/schema.js';
 import {productTables} from '../api/product-schema.js';
+import {reliabilityIndexes} from '../api/migrations.js';
 
 const base={DB_HOST:'localhost',DB_DATABASE:'telegram_test',DB_USER:'test',DB_PASSWORD:'test'};
 test('DB configuration validates engines, names, ports, privileges and TLS',()=>{
@@ -14,7 +15,8 @@ test('DB configuration validates engines, names, ports, privileges and TLS',()=>
   assert.equal(databaseConfig(base).options.ssl,false);
   assert.equal(databaseConfig({...base,DB_TYPE:'postgresql',DB_PORT:''}).options.port,5432);
   assert.equal(databaseConfig({...base,DB_TYPE:'postgresql',DB_PORT:'15432',DB_AUTO_CREATE_DATABASE:'false'}).autoCreate,false);
-  for(const invalid of [{DB_TYPE:'sqlite'},{DB_DATABASE:'bad"name'},{DB_PORT:'0'},{DB_POOL_SIZE:'101'},{DB_AUTO_CREATE_DATABASE:'0'},{DB_SSL_MODE:'require'},{DB_PASSWORD:''},{DB_TYPE:'postgresql',DB_MAINTENANCE_DATABASE:'unsafe;sql'},{DB_TYPE:'postgresql',DB_DATABASE:'a'.repeat(64)}])assert.throws(()=>databaseConfig({...base,...invalid}));
+  for(const invalid of [{DB_TYPE:'sqlite'},{DB_DATABASE:'bad"name'},{DB_PORT:'0'},{DB_POOL_SIZE:'101'},{DB_AUTO_CREATE_DATABASE:'0'},{DB_SCHEMA_INIT:'0'},{DB_SCHEMA_INIT:'false'},{DB_SCHEMA_LOCK_TIMEOUT_SECONDS:'0'},{DB_SCHEMA_LOCK_TIMEOUT_SECONDS:'301'},{DB_SSL_MODE:'require'},{DB_PASSWORD:''},{DB_TYPE:'postgresql',DB_MAINTENANCE_DATABASE:'unsafe;sql'},{DB_TYPE:'postgresql',DB_DATABASE:'a'.repeat(64)}])assert.throws(()=>databaseConfig({...base,...invalid}));
+  assert.doesNotThrow(()=>databaseConfig({...base,DB_SCHEMA_INIT:'false',DB_AUTO_CREATE_DATABASE:'false'}));
   for(const type of ['mysql','postgresql']){
     const config=databaseConfig({...base,DB_TYPE:type,DB_SSL_MODE:'verify-full',DB_SSL_CA:'first\\nsecond'});
     assert.equal(config.options.ssl.rejectUnauthorized,true);
@@ -30,7 +32,7 @@ test('PostgreSQL bind translation preserves SQL literals, identifiers and commen
   assert.deepEqual(postgresParameters(escapes),{text:escapes.slice(0,-1).replace(', ?,',', $1,')+'$2',count:2});
 });
 test('manual SQL stays aligned with both runtime schemas',async()=>{
-  for(const [file,ddl] of [['init.sql',[...tables,...productTables('mysql').map(entry=>typeof entry==='string'?entry:entry.sql)]],['postgresql/init.sql',[...postgresTables,...productTables('postgresql')]]]){
+  for(const [file,ddl] of [['init.sql',[...tables,...productTables('mysql').map(entry=>typeof entry==='string'?entry:entry.sql)]],['postgresql/init.sql',[...postgresTables,...productTables('postgresql'),...reliabilityIndexes('postgresql')]]]){
     const sql=await readFile(new URL('../sql/'+file,import.meta.url),'utf8');
     for(const statement of ddl)assert.ok(sql.includes(statement+';'),file);
   }

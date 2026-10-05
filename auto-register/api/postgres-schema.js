@@ -19,7 +19,7 @@ export const postgresTables=[
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_user_email ON user_info(LOWER(email))`,
   `CREATE TABLE IF NOT EXISTS tg_info (
     account_id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) NOT NULL,
-    api_id BIGINT NOT NULL, api_hash TEXT NOT NULL, phone TEXT NOT NULL,
+    api_id BIGINT NOT NULL, api_hash TEXT NOT NULL, phone TEXT NOT NULL, phone_key VARCHAR(64),
     session TEXT NOT NULL, status VARCHAR(32) NOT NULL, expires_at BIGINT,
     phone_code_hash TEXT, pending_bot TEXT, pending_channel TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -61,6 +61,7 @@ export const postgresTables=[
   )`,
   `CREATE TABLE IF NOT EXISTS api_jobs (
     id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(36) NOT NULL, user_id VARCHAR(36) NOT NULL,
+    project_id VARCHAR(36), workflow_id VARCHAR(36),
     phone_key VARCHAR(64) NOT NULL, auth_version BIGINT NOT NULL, path VARCHAR(512) NOT NULL,
     body TEXT NOT NULL, fingerprint VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL,
     effect VARCHAR(32), result TEXT, error JSONB, lease VARCHAR(36),
@@ -72,6 +73,7 @@ export const postgresTables=[
   `CREATE TABLE IF NOT EXISTS webhook_deliveries (
     bot_id VARCHAR(32) NOT NULL, update_id VARCHAR(32) NOT NULL, payload TEXT NOT NULL,
     status VARCHAR(16) NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+    remote_message_id VARCHAR(32),
     lease VARCHAR(36), lease_until BIGINT NOT NULL DEFAULT 0, next_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY(bot_id,update_id)
   )`,

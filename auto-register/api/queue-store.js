@@ -8,9 +8,9 @@ export function queueStore(store,table,running) {
   const one=async(sql,args=[])=>{const [rows]=await store.pool.execute(sql,args);return rows[0]||null;};
   return {
     one,
-    async update(row,values,leased=false) {
+    async update(row,values,leased=false,connection=store.pool) {
       const fields=Object.keys(values);
-      const [result]=await store.pool.execute(`UPDATE ${table} SET ${fields.map(f=>`${f}=?`).join(',')} WHERE ${where}${leased?' AND lease=?':''}`,[...Object.values(values),...key(row),...(leased?[row.lease]:[])]);
+      const [result]=await connection.execute(`UPDATE ${table} SET ${fields.map(f=>`${f}=?`).join(',')} WHERE ${where}${leased?' AND lease=?':''}`,[...Object.values(values),...key(row),...(leased?[row.lease]:[])]);
       return result.affectedRows;
     },
     async claim(seconds) {
@@ -24,7 +24,10 @@ export function queueStore(store,table,running) {
       });
     },
     async heartbeat(row,seconds){return this.update(row,{lease_until:Date.now()+seconds*1000},true);},
-    async cleanup(seconds){await store.pool.execute(`DELETE FROM ${table} WHERE status IN ('succeeded','failed','cancelled','sent') AND updated_at<?`,[Date.now()-seconds*1000]);},
+    async cleanup(seconds){
+      const retained=table==='api_jobs'?" AND NOT EXISTS (SELECT 1 FROM workflow_steps s JOIN workflow_runs r ON r.id=s.workflow_id WHERE s.job_id=api_jobs.id AND r.status NOT IN ('succeeded','cancelled'))":'';
+      await store.pool.execute(`DELETE FROM ${table} WHERE status IN ('succeeded','failed','cancelled','sent') AND updated_at<?${retained}`,[Date.now()-seconds*1000]);
+    },
   };
 }
 export function background(action,{interval=1000,onError=()=>{}}={}) {

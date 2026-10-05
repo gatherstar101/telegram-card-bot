@@ -62,27 +62,38 @@ export function installProductStore(store, crypt,env) {
     async telegramApps(userId,after='') {return rows('SELECT id,name,api_id,version,created_at,updated_at FROM telegram_apps WHERE user_id=? AND id>? ORDER BY id LIMIT 100',[userId,after]);},
     async telegramApp(userId,id) {const row=await one('SELECT * FROM telegram_apps WHERE id=? AND user_id=?',[id,userId]);if(!row)throw new Failure(404,'App 配置不存在');return {...row,api_id:Number(row.api_id),api_hash:crypt.open(row.api_hash,`app:${id}:api_hash`)};},
     async claimPhone(userId,phone,suggestedId) {
+      if(await one('SELECT account_id FROM tg_info WHERE phone_key IS NULL LIMIT 1'))throw new Failure(503,'历史账号手机号索引未补齐，请运行 npm run backfill:phones','PHONE_INDEX_NOT_READY','contact_administrator');
       const key=digest(phone);const found=await one('SELECT * FROM telegram_phone_claims WHERE phone_key=?',[key]);
       if(found){if(found.user_id!==userId)throw new Failure(409,'该 Telegram 账号已绑定其他用户','IDENTITY_CONFLICT','contact_administrator');return found.account_id;}
-      // Backfill only the requested phone; legacy credentials remain encrypted.
-      let account=suggestedId;
-      let after='';
-      while(true){const legacy=await rows("SELECT account_id,user_id,phone FROM tg_info WHERE (status='authorized' OR user_id=?) AND account_id>? ORDER BY account_id LIMIT 100",[userId,after]);for(const item of legacy)if(crypt.open(item.phone,`tg:${item.account_id}:phone`)===phone){if(item.user_id!==userId)throw new Failure(409,'该 Telegram 账号已绑定其他用户','IDENTITY_CONFLICT','contact_administrator');account=item.account_id;}if(legacy.length<100)break;after=legacy.at(-1).account_id;}
-      return account;
+      // Unverified attempts only reuse their owner's account; they never claim ownership.
+      const accounts=await rows("SELECT account_id,user_id,status FROM tg_info WHERE phone_key=? AND (status='authorized' OR user_id=?) ORDER BY account_id",[key,userId]);
+      if(accounts.some(account=>account.user_id!==userId))throw new Failure(409,'该 Telegram 账号已绑定其他用户','IDENTITY_CONFLICT','contact_administrator');
+      return (accounts.find(account=>account.status==='authorized')||accounts[0])?.account_id||suggestedId;
     },
     async recordIdentity(userId,accountId,me,phone) {
       const telegramId=String(me.id);
       if(!/^\d{1,20}$/.test(telegramId))throw new Failure(502,'Telegram 身份返回无效');
-      const existing=await one('SELECT user_id,account_id FROM telegram_identities WHERE telegram_user_id=?',[telegramId]);
-      if(existing&&(existing.user_id!==userId||existing.account_id!==accountId))throw new Failure(409,'Telegram 身份已绑定其他账号','IDENTITY_CONFLICT','contact_administrator');
       const profile={id:telegramId,username:me.username||null,first_name:me.firstName??me.first_name??null,last_name:me.lastName??me.last_name??null};
       try{
-        const encrypted=crypt.seal(JSON.stringify(profile),`identity:${telegramId}`);
-        if(existing)await pool.execute('UPDATE telegram_identities SET profile=?,updated_at=? WHERE telegram_user_id=? AND user_id=? AND account_id=?',[encrypted,Date.now(),telegramId,userId,accountId]);
-        else await pool.execute('INSERT INTO telegram_identities(telegram_user_id,user_id,account_id,profile,updated_at) VALUES(?,?,?,?,?)',[telegramId,userId,accountId,encrypted,Date.now()]);
+        await transaction(async connection=>{
+          await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[userId]);
+          await this.businessState(userId,connection);
+          const account=await one('SELECT user_id,phone_key FROM tg_info WHERE account_id=? FOR UPDATE',[accountId],connection);
+          if(!account||account.user_id!==userId)throw new Failure(404,'Telegram 账号不存在');
+          if(phone&&account.phone_key!==digest(phone))throw new Failure(409,'手机号与登录账号不匹配','IDENTITY_CONFLICT','contact_administrator');
+          const existing=await one('SELECT user_id,account_id FROM telegram_identities WHERE telegram_user_id=?',[telegramId],connection);
+          if(existing&&(existing.user_id!==userId||existing.account_id!==accountId))throw new Failure(409,'Telegram 身份已绑定其他账号','IDENTITY_CONFLICT','contact_administrator');
+          const encrypted=crypt.seal(JSON.stringify(profile),`identity:${telegramId}`);
+          if(existing)await connection.execute('UPDATE telegram_identities SET profile=?,updated_at=? WHERE telegram_user_id=? AND user_id=? AND account_id=?',[encrypted,Date.now(),telegramId,userId,accountId]);
+          else await connection.execute('INSERT INTO telegram_identities(telegram_user_id,user_id,account_id,profile,updated_at) VALUES(?,?,?,?,?)',[telegramId,userId,accountId,encrypted,Date.now()]);
+          if(phone){
+            const key=digest(phone);const claimed=await one('SELECT * FROM telegram_phone_claims WHERE phone_key=?',[key],connection);
+            if(claimed&&(claimed.user_id!==userId||claimed.account_id!==accountId))throw new Failure(409,'手机号已绑定其他账号','IDENTITY_CONFLICT','contact_administrator');
+            if(!claimed)await connection.execute('INSERT INTO telegram_phone_claims(phone_key,user_id,account_id,updated_at) VALUES(?,?,?,?)',[key,userId,accountId,Date.now()]);
+          }
+        });
       }
       catch(error){if(duplicate(error))throw new Failure(409,'Telegram 身份绑定冲突','IDENTITY_CONFLICT','contact_administrator');throw error;}
-      if(phone){const claimed=await one('SELECT * FROM telegram_phone_claims WHERE phone_key=?',[digest(phone)]);if(claimed&&(claimed.user_id!==userId||claimed.account_id!==accountId))throw new Failure(409,'手机号已绑定其他账号','IDENTITY_CONFLICT','contact_administrator');if(!claimed)try{await pool.execute('INSERT INTO telegram_phone_claims(phone_key,user_id,account_id,updated_at) VALUES(?,?,?,?)',[digest(phone),userId,accountId,Date.now()]);}catch(error){if(duplicate(error))throw new Failure(409,'手机号绑定冲突','IDENTITY_CONFLICT','contact_administrator');throw error;}}
     },
     async project(userId,id,connection=pool) {const row=await one('SELECT * FROM project_info WHERE id=? AND user_id=?',[id,userId],connection);if(!row)throw new Failure(404,'项目不存在');return row;},
     async projectConfig(id,version) {const row=await one('SELECT config FROM project_versions WHERE project_id=? AND version=?',[id,version]);if(!row)throw new Failure(404,'配置版本不存在');return JSON.parse(crypt.open(row.config,`project:${id}:${version}`));},
@@ -104,7 +115,11 @@ export function installProductStore(store, crypt,env) {
     },
     projects:(userId,after='')=>rows('SELECT * FROM project_info WHERE user_id=? AND id>? ORDER BY id LIMIT 100',[userId,after]),
     resources:projectId=>rows('SELECT * FROM project_resources WHERE project_id=?',[projectId]),
-    async resource(projectId,environment,kind) {return one('SELECT * FROM project_resources WHERE project_id=? AND environment=? AND kind=?',[projectId,environment,kind]);},
+    async resource(projectId,environment,kind,connection=pool) {return one('SELECT * FROM project_resources WHERE project_id=? AND environment=? AND kind=?',[projectId,environment,kind],connection);},
+    async isPublishedVersion(projectId,version,connection=pool) {
+      if(!Number.isSafeInteger(Number(version))||Number(version)<1)return false;
+      return Boolean(await one("SELECT id FROM workflow_runs WHERE project_id=? AND environment='production' AND version=? AND status='succeeded' LIMIT 1",[projectId,version],connection));
+    },
     async bindResource(projectId,environment,kind,value) {
       const current=await this.resource(projectId,environment,kind);
       if(current&&((kind==='bot'&&String(current.bot_id)!==String(value.bot_id))||current.channel_key!==(value.channel_key||null)))throw new Failure(409,'资源绑定不可替换');
@@ -119,9 +134,9 @@ export function installProductStore(store, crypt,env) {
       const version=row.environment==='production'?row.published_version:row.version;
       return {...row,version,config:await this.projectConfig(row.id,version||row.draft_version)};
     },
-    async event({user_id,project_id=null,bot_id=null,environment=null,type:eventType,event_key=randomUUID(),source=null,data={},raw_update=null},connection=pool) {
+    async event({user_id,project_id=null,bot_id=null,environment=null,type:eventType,event_key=randomUUID(),source=null,data={},raw_update=null,occurred_at=Date.now()},connection=pool) {
       const id=randomUUID();
-      try{const [result]=await connection.execute('INSERT INTO business_events(id,event_key,user_id,project_id,bot_id,environment,version,type,source,occurred_at,data,raw_update) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'+(type==='postgresql'?' ON CONFLICT(event_key) DO NOTHING':''),[id,digest(event_key),user_id,project_id,bot_id,environment,data.version??null,eventType,source,Date.now(),crypt.seal(JSON.stringify(data),`event:${id}:data`),raw_update?crypt.seal(JSON.stringify(raw_update),`event:${id}:raw`):null]);if(type==='postgresql'&&!result.affectedRows)return false;}
+      try{const [result]=await connection.execute('INSERT INTO business_events(id,event_key,user_id,project_id,bot_id,environment,version,type,source,occurred_at,data,raw_update) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'+(type==='postgresql'?' ON CONFLICT(event_key) DO NOTHING':''),[id,digest(event_key),user_id,project_id,bot_id,environment,data.version??null,eventType,source,occurred_at,crypt.seal(JSON.stringify(data),`event:${id}:data`),raw_update?crypt.seal(JSON.stringify(raw_update),`event:${id}:raw`):null]);if(type==='postgresql'&&!result.affectedRows)return false;}
       catch(error){if(duplicate(error))return false;throw error;}return true;
     },
     async visitor(userId,botId,from) {
@@ -163,10 +178,15 @@ export function installProductStore(store, crypt,env) {
       return {changed,next_cursor:result.length?spec.keys.map(key=>String(result.at(-1)[key])).join(':'):cursor,done:result.length<limit};
     },
     async operationStatus(userId) {const [active]=await pool.execute("SELECT kind,COUNT(*) AS count FROM business_dispatches WHERE user_id=? AND status='admitted' GROUP BY kind",[userId]);return {in_flight:active,remote_cleanup:'not_requested'};},
-    async phoneAccount(userId,phone) {const row=await one('SELECT account_id FROM telegram_phone_claims WHERE phone_key=? AND user_id=?',[digest(phone),userId]);return row?.account_id||null;},
+    async phoneAccount(userId,phone) {const key=digest(phone);const row=await one('SELECT account_id FROM telegram_phone_claims WHERE phone_key=? AND user_id=?',[key,userId]);return row?.account_id||(await one('SELECT account_id FROM tg_info WHERE phone_key=? AND user_id=? ORDER BY account_id LIMIT 1',[key,userId]))?.account_id||null;},
     async assertTask(id,userId) {
       await this.assertBusiness(userId);
-      const linked=await one('SELECT p.id AS project_id,p.status,p.epoch,r.version AS config_version,r.environment,r.project_epoch,r.status AS workflow_status,p.active_workflow,r.id,r.business_epoch FROM workflow_steps s JOIN workflow_runs r ON r.id=s.workflow_id JOIN project_info p ON p.id=r.project_id WHERE s.job_id=?',[id]);
+      const job=await one('SELECT project_id,workflow_id FROM api_jobs WHERE id=? AND user_id=?',[id,userId]);
+      if(!job)throw new Failure(404,'任务不存在');
+      const columns='p.id AS project_id,p.status,p.epoch,r.version AS config_version,r.environment,r.project_epoch,r.status AS workflow_status,p.active_workflow,r.id,r.business_epoch';
+      // Explicit ownership cannot fall back to standalone execution if a link is missing.
+      const linked=job.workflow_id?await one(`SELECT ${columns} FROM workflow_runs r JOIN project_info p ON p.id=r.project_id WHERE r.id=? AND r.project_id=? AND r.user_id=? AND p.user_id=? AND EXISTS (SELECT 1 FROM workflow_steps s WHERE s.workflow_id=r.id AND s.job_id=?)`,[job.workflow_id,job.project_id,userId,userId,id]):await one(`SELECT ${columns} FROM workflow_steps s JOIN workflow_runs r ON r.id=s.workflow_id JOIN project_info p ON p.id=r.project_id WHERE s.job_id=? AND r.user_id=? AND p.user_id=? ORDER BY CASE WHEN p.active_workflow=r.id THEN 0 ELSE 1 END,r.created_at DESC LIMIT 1`,[id,userId,userId]);
+      if((job.workflow_id||job.project_id)&&!linked)throw new Failure(409,'任务流程关联无效','PROJECT_INACTIVE','review');
       if(linked&&(linked.status!=='active'||Number(linked.epoch)!==Number(linked.project_epoch)||linked.active_workflow!==linked.id||!['queued','running'].includes(linked.workflow_status)))throw new Failure(409,'项目流程已停止','PROJECT_INACTIVE','review');
       if(linked)await this.assertBusiness(userId,linked.business_epoch);
       return linked;

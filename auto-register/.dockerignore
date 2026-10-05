@@ -4,5 +4,7 @@ node_modules
 .env.*
 scripts/*
 !scripts/assign-account.js
+!scripts/migrate.js
+!scripts/backfill-phones.js
 .dev.vars*
 data
