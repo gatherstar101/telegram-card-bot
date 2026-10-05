@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import { digest } from './auth.js';
 import { Failure } from './errors.js';
-import { integer,validateConfig,rate,requireAdmin,audit } from './security.js';
+import { integer,validateConfig,rate,requireAdmin,audit,adminIPGuard } from './security.js';
 import { isTask } from './jobs.js';
 import { withLease } from './queue-store.js';
+import { adminOperation,adminRoute } from './admin.js';
 
 export function clientIP(req,env){
   const hops=integer(env,'TRUST_PROXY_HOPS',0,0,10);const direct=req.socket.remoteAddress||'unknown';
@@ -18,19 +19,44 @@ export function createApplication({store,auth,service,jobs,deliveries,env=proces
   return async(req,res)=>{
     const start=Date.now();const requestId=randomUUID();res.setHeader('Content-Type','application/json; charset=utf-8');res.setHeader('Cache-Control','no-store');res.setHeader('X-Request-ID',requestId);
     const respond=(status,value)=>{res.writeHead(status);res.end(JSON.stringify(value));};
+    let adminContext;
+    let adminAuthenticationFailed=false;
     try{
       const url=new URL(req.url,'http://localhost');const path=url.pathname;const method=req.method;
       if(method==='GET'&&path==='/health')return respond(200,{ok:true});
       if(method==='GET'&&path==='/ready'){try{validateConfig(env);if(!env.SMTP_HOST||!env.SMTP_FROM)throw new Error();await Promise.all([store.ready(),auth.ready()]);return respond(200,{ok:true});}catch{return respond(503,{ok:false});}}
       const webhook=path.match(/^\/webhooks\/(\d+)$/);const ip=clientIP(req,env);
+      if(path.startsWith('/admin/'))adminContext={request_id:requestId,started_at:start,actor_type:'anonymous',actor_id:null,ip,peer_ip:req.socket.remoteAddress||'unknown',user_agent:[...(req.headers['user-agent']||'').replace(/[\x00-\x1f\x7f]/g,'')].slice(0,512).join(''),method:method.slice(0,8),...adminOperation(method,path)};
+      if(adminContext)await adminIPGuard(auth.cache,env,ip);
       await rate(auth.cache,env,webhook?'webhook-ingress':'ingress',ip,integer(env,webhook?'WEBHOOK_IP_PER_MINUTE':'API_IP_PER_MINUTE',webhook?1200:120,1,10000));
       if(method==='POST'&&['/auth/register/start','/auth/login/start','/v1/login/start'].includes(path))await rate(auth.cache,env,'code-ip-second',ip,integer(env,'OTP_IP_QPS',1,1,100),1);
-      const body=await bodyOf(req);
       if(path.startsWith('/admin/')){
-        requireAdmin({headers:new Headers({Authorization:req.headers.authorization||''})},env);
-        if(method==='POST'&&path==='/admin/credentials/rewrap'){const result=await store.rewrap(body.table,body.cursor??'',body.limit??50);audit('credentials_rewrapped',{table:body.table,changed:result.changed});return respond(200,result);}
-        const match=path.match(/^\/admin\/users\/([a-f0-9-]{36})\/disabled$/);if(method==='PUT'&&match){if(typeof body.disabled!=='boolean')throw new Failure(400,'disabled 必须为布尔值');await store.disableUser(match[1],body.disabled);audit('user_disabled_changed',{user_id:match[1],disabled:body.disabled});return respond(200,{ok:true});}throw new Failure(404,'接口不存在');
+        if(adminContext.action==='admin.login'){
+          let result;
+          try{const body=await bodyOf(req);result=await auth.adminLogin(body,ip);}
+          catch(error){adminAuthenticationFailed=[400,401,403].includes(error.status);throw error;}
+          adminContext.actor_type='admin';adminContext.actor_id=result.user.id;
+          await adminIPGuard(auth.cache,env,ip);
+          await store.appendAudit({...adminContext,status:200});adminContext.recorded=true;
+          return respond(200,result);
+        }
+        let keyAccepted=false;
+        try{requireAdmin({headers:new Headers({Authorization:req.headers.authorization||''})},env);keyAccepted=true;}catch{}
+        if(keyAccepted)adminContext.actor_type='api_key';
+        else{
+          try{
+            const {user}=await auth.authenticate(req.headers.authorization);
+            adminContext.actor_id=user.id;adminContext.actor_type=user.role==='admin'?'admin':'user';adminContext.actor_auth_version=user.auth_version;
+            if(user.role!=='admin')throw new Failure(403,'需要管理员权限');
+          }catch(error){adminAuthenticationFailed=[401,403].includes(error.status);throw error;}
+        }
+        await adminIPGuard(auth.cache,env,ip);
+        const body=await bodyOf(req);
+        const result=await adminRoute({store,method,path,url,body,context:adminContext});
+        if(!adminContext.recorded){await store.appendAudit({...adminContext,status:200});adminContext.recorded=true;}
+        return respond(200,result);
       }
+      const body=await bodyOf(req);
       if(webhook){if(method!=='POST')throw new Failure(405,'Webhook 仅支持 POST');return respond(200,await deliveries.receive(webhook[1],req.headers['x-telegram-bot-api-secret-token'],body));}
       if(path.startsWith('/auth/'))return respond(200,await auth.route(method,path,body,req.headers.authorization,ip));
       const {user}=await auth.authenticate(req.headers.authorization);await rate(auth.cache,env,'user',user.id,integer(env,'API_USER_PER_MINUTE',60,1,10000));
@@ -47,7 +73,15 @@ export function createApplication({store,auth,service,jobs,deliveries,env=proces
       if(method==='POST'&&isTask(path))return respond(202,await jobs.enqueue(path,body,user,account));
       const deliveryMatch=path.match(/\/bots\/([A-Za-z0-9_]+)\/deliveries\/(\d+)(?:\/(retry))?$/);if(deliveryMatch){const row=await deliveries.owned(user,account,deliveryMatch[1],deliveryMatch[2]);if(method==='GET'&&!deliveryMatch[3])return respond(200,deliveries.view(row));if(method==='POST'&&deliveryMatch[3])return respond(200,await deliveries.retry(row,body.allow_duplicate));throw new Failure(404,'接口不存在');}
       return respond(200,await service.route(method,path,body,user));
-    }catch(error){const status=error.status||(error.errorMessage?.startsWith('FLOOD_WAIT')?429:error.errorMessage?422:500);if(status===429&&error.retry_after)res.setHeader('Retry-After',String(Math.max(1,Math.ceil(error.retry_after))));respond(status,{error:error.status?error.message:error.errorMessage||'服务内部错误',...(error.retry_after?{retry_after:error.retry_after}:{})});}
+    }catch(error){
+      if(adminContext&&adminAuthenticationFailed){
+        adminContext.changes={security:{authentication_failed:true}};
+        try{await adminIPGuard(auth.cache,env,adminContext.ip,{failed:true});}catch(guardError){error=guardError;}
+      }
+      if(adminContext&&error.admin_ip_banned)adminContext.changes={security:{...adminContext.changes?.security,ip_banned:true}};
+      let status=error.status||(error.errorMessage?.startsWith('FLOOD_WAIT')?429:error.errorMessage?422:500);
+      if(adminContext&&!adminContext.recorded){try{await store.appendAudit({...adminContext,status});}catch{audit('admin_audit_storage_error',{request_id:requestId});error=new Failure(503,'审计存储不可用，请稍后重试');status=503;}}
+      if(status===429&&error.retry_after)res.setHeader('Retry-After',String(Math.max(1,Math.ceil(error.retry_after))));respond(status,{error:error.status?error.message:error.errorMessage||'服务内部错误',...(error.retry_after?{retry_after:error.retry_after}:{})});}
     finally{audit('request_completed',{request_id:requestId,status:res.statusCode,duration_ms:Date.now()-start});}
   };
 }

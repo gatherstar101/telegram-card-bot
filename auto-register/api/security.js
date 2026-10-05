@@ -1,6 +1,7 @@
 import { createCipheriv,createDecipheriv,randomBytes,timingSafeEqual } from 'node:crypto';
 import { Failure } from './errors.js';
 import { digest } from './auth.js';
+import { adminConfiguration } from './admin.js';
 
 export function integer(env,name,fallback,min=1,max=100000) {
   const value=Number(env[name] ?? fallback);
@@ -53,6 +54,22 @@ export function requireAdmin(request,env) {
   const expected=Buffer.from(`Bearer ${env.ADMIN_API_KEY}`);
   if(provided.length!==expected.length||!timingSafeEqual(provided,expected))throw new Failure(401,'管理员凭据无效');
 }
+export const adminIPKey=(env,ip)=>`${env.REDIS_KEY_PREFIX||'telegram-bot:'}admin-ip:${digest(String(ip))}`;
+export async function adminIPGuard(cache,env,ip,{failed=false}={}) {
+  const maximum=integer(env,'ADMIN_AUTH_MAX_FAILURES',2,1,10);
+  const seconds=integer(env,'ADMIN_IP_BAN_SECONDS',3600,60,86400);
+  let remaining;
+  try{
+    const key=adminIPKey(env,ip);
+    remaining=Number(await (failed?cache.adminAuthFailure(key,maximum,seconds):cache.adminIPBanTTL(key,maximum)));
+  }catch{throw new Failure(503,'管理员防爆破校验不可用，请稍后重试');}
+  if(remaining>0){
+    const error=new Failure(429,'此 IP 已被暂时禁止访问管理员接口');
+    error.retry_after=remaining;
+    error.admin_ip_banned=true;
+    throw error;
+  }
+}
 export async function rate(cache,env,kind,value,max,seconds=60) {
   const key=`${env.REDIS_KEY_PREFIX||'telegram-bot:'}limit:${kind}:${digest(String(value))}`;
   if(await cache.increment(key,seconds)>max) {
@@ -64,13 +81,16 @@ export async function rate(cache,env,kind,value,max,seconds=60) {
 export function audit(event,fields={}) {
   // Call sites supply only fixed action names, UUIDs, HTTP statuses and counts.
   // Never log body, headers, raw URL, exception text or external API URL.
-  console.log(JSON.stringify({event,...fields}));
+  console.log(JSON.stringify({time:new Date().toISOString(),event,...fields}));
 }
 
 export function validateConfig(env) {
+  adminConfiguration(env);
+  if (env.ADMIN_API_KEY && env.ADMIN_API_KEY.length < 32) throw new Error('ADMIN_API_KEY 至少需要 32 字符');
   credentials(env);
   for(const [name,fallback,min,max] of [
     ['OTP_IP_QPS',1,1,100],['API_IP_PER_MINUTE',120,1,10000],['API_USER_PER_MINUTE',60,1,10000],['WEBHOOK_IP_PER_MINUTE',1200,1,10000],
+    ['ADMIN_AUTH_MAX_FAILURES',2,1,10],['ADMIN_IP_BAN_SECONDS',3600,60,86400],
     ['TG_LOGIN_PER_TEN_MINUTES',5,1,20],['TG_CREATE_PER_TEN_MINUTES',10,1,100],['MAX_TG_ACCOUNTS_PER_USER',5,1,100],['MAX_BOTS_PER_USER',20,1,1000],['MAX_CHANNELS_PER_USER',50,1,1000],
     ['TELEGRAM_TIMEOUT_SECONDS',60,15,240],['JOB_TIMEOUT_SECONDS',240,30,240],['JOB_QUEUE_LIMIT',20,1,100],['JOB_RETENTION_SECONDS',604800,86400,2592000],
     ['WEBHOOK_CHAT_PER_MINUTE',5,1,60],['WEBHOOK_BOT_PER_MINUTE',300,1,3000],['WEBHOOK_QUEUE_LIMIT',500,1,10000],['WEBHOOK_RETENTION_SECONDS',604800,172800,2592000],

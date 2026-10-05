@@ -11,7 +11,7 @@ export function emailAddress(value) {
   if (email.length > 254 || !/^[a-z0-9.!#$%&'*+\-/=?^_`{|}~]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(email)) throw new Failure(400, '邮箱格式错误');
   return email;
 }
-function passwordValue(value) {
+export function passwordValue(value) {
   if (typeof value !== 'string' || value.length < 12 || value.length > 128) throw new Failure(400, '密码必须为 12–128 字符');
   return value;
 }
@@ -62,7 +62,7 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
   const challengeKey = id => `${prefix}challenge:${id}`;
   const sessionKey = token => `${prefix}session:${digest(token)}`;
   const otpHash = (id, code) => createHmac('sha256', secret).update(`${id}:${code}`).digest('hex');
-  const safeUser = user => ({ id: user.id, email: user.email });
+  const safeUser = user => ({ id: user.id, email: user.email, role: user.role || 'user' });
   async function limit(kind, value, maximum, seconds = challengeTTL) {
     const count = await state.increment(`${prefix}rate:${kind}:${digest(value)}`, seconds);
     if (Number(count)>maximum) {
@@ -113,6 +113,17 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
   }
   return {
     authenticate,
+    async adminLogin(body, ip) {
+      await limit('admin-login-ip', ip, 20);
+      const email = emailAddress(body.email);
+      passwordValue(body.password);
+      await limit('admin-password-email', email, 10);
+      const user = await store.userByEmail(email);
+      const fallback = '00000000000000000000000000000000:' + '00'.repeat(64);
+      const matches = await verifyPassword(body.password, user?.password_hash || fallback);
+      if (!user || user.disabled || user.role !== 'admin' || !matches) throw new Failure(401, '管理员账号或密码错误');
+      return session(user);
+    },
     async requireAccount(userId, accountId) {
       if (!await store.ownsAccount(userId, accountId)) throw new Failure(404, '账号不存在');
     },
@@ -146,13 +157,15 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
         // Do comparable password work even when the email does not exist.
         const fallback = '00000000000000000000000000000000:' + '00'.repeat(64);
         const matches = await verifyPassword(body.password, user?.password_hash || fallback);
-        if (!user || user.disabled || !matches) throw new Failure(401, '邮箱或密码错误');
+        // Administrators must use /admin/login so all password attempts are
+        // subject to the same IP ban, rather than a second login entry point.
+        if (!user || user.disabled || user.role === 'admin' || !matches) throw new Failure(401, '邮箱或密码错误');
         return issue('login', email, { user_id: user.id, auth_version: user.auth_version || 0 });
       }
       if (method === 'POST' && path === '/auth/login/verify') {
         const challenge = await consume(body, 'login', ip);
         const user = await store.userById(challenge.user_id);
-        if (!user || user.disabled || (challenge.auth_version || 0)!==(user.auth_version || 0)) throw new Failure(401, '用户不存在或登录验证已撤销');
+        if (!user || user.disabled || user.role === 'admin' || (challenge.auth_version || 0)!==(user.auth_version || 0)) throw new Failure(401, '用户不存在或登录验证已撤销');
         return session(user);
       }
       if (method === 'POST' && path === '/auth/logout-all' && store.revokeSessions) {

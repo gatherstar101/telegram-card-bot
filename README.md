@@ -4,9 +4,12 @@
 
 本服务支持邮箱密码及邮件一次性验证码鉴权，登录个人 Telegram 账号，自动创建 Bot 并获取 Token，配置不同客户的 Landing Page 卡片，注册 Webhook，创建私有 Channel 和发布引导帖子。只需构建 `auto-register/` 一个目录，平台鉴权、业务 API 和后台队列都包含在同一镜像内。`card-bot/` 保留为 Legacy 独立卡片 Worker。
 
-最新安全升级要求配置 `CREDENTIAL_KEYS` 和 `CREDENTIAL_KEY_ID`。创建 Bot/Channel/帖子与核对任务返回 **HTTP 202 + job_id**，需要查询任务结果。旧明文库先备份，再执行分页加密迁移，详见[升级说明](#upgrade)。
+管理员通过必填运行时 `ADMIN_EMAIL`、`ADMIN_PASSWORD` 在启动时直接创建，使用账号密码登录，无需邮件验证。管理员 API 支持查询用户、修改普通用户邮箱/密码/启停状态和查询操作审计；同 IP 默认累计两次认证失败后 Redis 封禁 3600 秒。Telegram 资源分配和白名单保留为待实现的 special case 设计。
+
+启动还要求配置 `AUTH_HMAC_SECRET`、`CREDENTIAL_KEYS`、`CREDENTIAL_KEY_ID` 及数据库/Redis。创建 Bot/Channel/帖子与核对任务返回 **HTTP 202 + job_id**，需要查询任务结果。旧明文库先备份，再执行分页加密迁移，详见[升级说明](#upgrade)。
 
 - [架构与数据](#architecture)
+- [管理员管理与 Special case 设计](#special-case)
 - [运行时环境变量](#configuration)
 - [Docker 构建、部署与检查](#build-and-verify)
 - [API 清单](#api-reference)
@@ -20,7 +23,7 @@
 
 ## 架构与数据
 
-平台邮箱身份和 Telegram 身份分别认证。首次邮箱验证成功时生成 UUID `user_id`；注册/登录返回的 `access_token` 用于本 API，默认 2 小时有效且访问不续期。用户随后提交 App api_id/api_hash、手机号与 Telegram 验证码，必要时提交两步验证密码。App configuration 和网页端已登录状态不能替代个人账号认证。
+平台身份和 Telegram 身份分别认证。普通用户首次邮箱验证成功时生成 UUID `user_id`，管理员的 UUID 则在首次启动初始化时生成。登录返回的 `access_token` 用于本 API，默认 2 小时有效且访问不续期；用户信息包含 id、email、role。用户随后提交 App api_id/api_hash、手机号与 Telegram 验证码，必要时提交两步验证密码。App configuration 和网页端已登录状态不能替代个人账号认证。
 
 每次 Telegram login/start 成功生成独立 `account_id`，调用方保存或通过 `GET /v1/accounts` 查回。所有账号、Bot、Channel、任务和投递检查用户归属，其他用户的资源返回 404。account_id 只是路径标识，不是鉴权凭据。Bot Token、App api_hash 和平台 access_token 用途不同。
 
@@ -28,7 +31,7 @@
 flowchart LR
     Caller[调用方] --> API[Node.js HTTP API]
     API --> SMTP[SMTP 邮件服务]
-    API --> Redis[(Redis 验证码 / 会话 / 限流 / 锁)]
+    API --> Redis[(Redis 验证码 / 会话 / IP 封禁 / 限流 / 锁)]
     API --> DB[(MySQL / PostgreSQL)]
     Queue[同容器后台任务与投递进程] --> DB
     Queue --> Redis
@@ -49,6 +52,8 @@ API 接收操作并持久化任务，后台轮询数据库队列，使用事务�
 | `bot_info` | Bot 信息与 Token、客户卡片、落地页和 Webhook 配置 |
 | `channel_info` | Channel 创建 key、频道 ID/access_hash、邀请链接及旧帖子 JSON |
 | `user_security` | 用户禁用标记与会话撤销版本 |
+| `user_admins` | 管理员角色归属，普通用户注册不能写入 |
+| `audit_logs` | 管理员操作时间、身份、IP、UA、目标用户、结果及脱敏变更 |
 | `channel_posts` | 新帖子独立记录、random_id 和发送状态 |
 | `api_jobs` | 持久化创建/核对任务、检查点、租约与结果 |
 | `webhook_deliveries` | update_id 去重、卡片投递状态和重试时间 |
@@ -70,8 +75,9 @@ auto-register/
   api/deliveries.js         Webhook 去重和后台投递
   api/queue-store.js        SQL 事务领取、租约与后台轮询
   api/security.js           密钥、管理员凭据、限流和脱敏审计
-  sql/init.sql              MySQL 新库八张表 SQL
-  sql/postgresql/init.sql    PostgreSQL 八张表与索引 SQL
+  api/admin.js              管理员初始化、用户修改参数及管理接口
+  sql/init.sql              MySQL 新库十张表 SQL
+  sql/postgresql/init.sql    PostgreSQL 十张表与索引 SQL
   sql/002-security.sql      MySQL 旧表字段扩容及辅助表 SQL
   Dockerfile / compose.yaml 单镜像部署
   .env.example              完整运行时变量模板
@@ -80,6 +86,62 @@ auto-register/
   test/                     单元与可选真实 MySQL/PostgreSQL 与 Redis 集成验证
 card-bot/                   Legacy 独立单 Bot 卡片 Worker
 ```
+
+<a id="special-case"></a>
+
+## 管理员管理与 Special case 设计
+
+main 保留“用户暂不配置 Telegram，由管理员后续协助”的[设计方案](auto-register/SPECIAL-CASE.md)。管理员账号、用户资料管理和操作审计已实现；Telegram 配置管理、资源分配和白名单仍为待实现设计。下方变量表和 API 清单介绍当前可用功能。
+
+### 设计理念与用户流程
+
+平台邮箱身份负责登录和资源归属，Telegram 身份负责操作 Telegram。用户可以先完成邮箱注册，暂时跳过 Telegram 配置；拥有 App 凭据的用户继续自行登录、创建 Bot/Channel、配置 Landing Page。当前已经支持分步注册与 Telegram 登录，后续设计在此基础上增加配置补充和管理员协助。
+
+普通流程以用户自有 Telegram 配置和资源为主。用户可在注册后的配置步骤提交自己的 `api_id/api_hash`，也可稍后自行补充或请管理员协助。App 凭据不能代替个人账号验证，Telegram 验证码和两步验证密码仍由账号本人提供。
+
+special case 面向无法自行提供配置的用户，计划默认关闭，由管理员控制启用。后续在同一个 Node.js API 服务内增加 Telegram App 配置管理，登记并验证平台已有 Bot/Channel，再分配给指定用户；沿用 `auto-register/` 的单镜像部署。平台初始化资源与用户自行创建资源分别处理。
+
+资源分配优先采用**一个业务用户一个 Bot**，每个 Bot 对应一套 Landing Page、卡片和 Webhook 配置。管理员可统一管理多个 Bot；多用户共用同一个 Bot 并配置不同 Landing Page，需要额外的路由设计，不属于本次保留方案。用户获得分配资源的业务权限，平台持有的 Bot Token 和个人 Telegram 登录态由平台保管。
+
+### 管理员初始化与登录
+
+管理员使用邮箱形式的账号，账号与密码通过以下**必填容器运行时 env** 指定，不提供默认密码：
+
+```dotenv
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=REPLACE_WITH_A_RANDOM_PASSWORD
+```
+
+首次启动直接保存管理员邮箱、scrypt 密码哈希和角色，**不需要邮箱验证**。密码长度为 12–128 字符；任一变量缺失或值无效时启动报错，Compose 也会检查是否填写。已有管理员时重启不覆盖密码；与已有普通用户邮箱冲突时报错，不自动提升权限。后续改密使用 `/auth/password`，不能仅修改 env 覆盖数据库密码。更换 `ADMIN_EMAIL` 不迁移或删除原账号；新邮箱不存在时会新增管理员。
+
+管理员通过 `POST /admin/login` 提交 email/password，直接获得 Redis 管理的 Bearer 会话，默认 2 小时有效，不发验证码、不依赖 SMTP。登录按 IP 和邮箱限流；普通用户不能用此接口登录。管理请求重新核对数据库角色、禁用状态和会话版本。
+
+普通 `/auth/login/start`、`/auth/login/verify` 不提供管理员登录，防止通过另一入口绕开管理员防爆破规则；管理员统一使用 `/admin/login`。
+
+管理员接口另有 Redis IP 防爆破：默认同一 IP 在 3600 秒内累计两次认证失败，从第二次失败起封禁全部 `/admin/*` 接口 3600 秒。封禁期间即使密码、管理员会话或 `ADMIN_API_KEY` 正确，也返回 429，并携带 `Retry-After` 和 `retry_after` 剩余秒数。成功认证不清零计数，封禁请求不延长 TTL，到期自动解除。
+
+计数包括管理员登录的账号密码错误、无效登录参数、管理凭据缺失/失效和非管理员身份；已经通过管理员认证后的业务参数错误或资源权限拒绝不计数。计数及封禁在单个 Redis key 内原子完成，多个服务副本共享；Redis 校验不可用时返回 503。封禁和失败请求仍保存审计日志。
+
+`ADMIN_API_KEY` 保留为可选独立管理凭据，也能调用管理接口，日志以 `api_key` 标识，不记录密钥。使用管理员会话时，日志可以关联具体管理员 user_id。`TG_*` 只提供 Telegram 默认值，不能当作 special case 开关或资源分配设置。
+
+### 基本白名单与实现状态
+
+计划按资源维护简单白名单：Bot 按 Telegram 发送者的 username 匹配，未匹配不响应业务请求；Channel 保持私有，使用需要审批的邀请链接，初期可由管理员人工按名单审批。开启限制且名单为空时拒绝访问。用户名变更后需重新核对，长期授权建议记录核实后的 Telegram 用户 ID。
+
+白名单控制 Bot 的响应和 Channel 的入群权限；仅在 API 检查归属不能限制 Telegram 内的频道访问。名单变更还需处理已有成员和旧邀请链接。允许访问的名单应覆盖实际访客，仅登记平台账号持有人会阻止其他访客接收 Landing Page 卡片。
+
+| 能力 | 当前状态 |
+| --- | --- |
+| 邮箱注册后稍后登录 Telegram、请求传入自有 App 凭据 | 已支持 |
+| `ADMIN_API_KEY` 管理员接口：禁用用户、凭据重加密 | 已支持 |
+| env 直接初始化管理员、账号密码登录及角色校验 | 已支持 |
+| 管理员查询用户、修改邮箱/密码/启停状态、查询审计日志 | 已支持 |
+| 管理员 Redis IP 防爆破、认证失败及封禁请求审计 | 已支持 |
+| 用户或管理员后续补充配置的管理接口 | 待实现 |
+| special case 启停、平台资源登记与指定用户分配 | 待实现 |
+| Bot 白名单、Channel 审批与白名单管理 | 待实现 |
+
+实现时同步提供 MySQL/PostgreSQL 升级、接口示例与运行时变量说明，并验证初始化幂等、权限隔离、名单匹配和配置持久化。具体规则见 [SPECIAL-CASE.md](auto-register/SPECIAL-CASE.md)。
 
 <a id="configuration"></a>
 
@@ -94,6 +156,10 @@ card-bot/                   Legacy 独立单 Bot 卡片 Worker
 | `AUTH_HMAC_SECRET` | 必填，至少 32 字符随机值，OTP HMAC 密钥 |
 | `CREDENTIAL_KEYS` | 必填，JSON 密钥环，每个值为 32 字节随机密钥的 base64 |
 | `CREDENTIAL_KEY_ID` | 必填，例如 v1，须存在于密钥环 |
+| `ADMIN_EMAIL` | 必填，管理员登录邮箱；首次启动直接创建，无邮箱验证 |
+| `ADMIN_PASSWORD` | 必填，12–128 字符；仅首次创建时写入密码哈希，重启不覆盖 |
+| `ADMIN_AUTH_MAX_FAILURES` | 2；同一 IP 认证失败次数达到此值时封禁，允许 1–10 |
+| `ADMIN_IP_BAN_SECONDS` | 3600；封禁时长及认证失败计数窗口，允许 60–86400 秒 |
 | `ADMIN_API_KEY` | 可选，管理员接口独立随机凭据，至少 32 字符 |
 | `AUTH_CHALLENGE_TTL_SECONDS` | 600，允许 60–3600 秒 |
 | `AUTH_SESSION_TTL_SECONDS` | 7200，允许 60–86400 秒，访问不续期 |
@@ -135,7 +201,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 
 把 JSON 密钥环按一行放入 .env，例如 `CREDENTIAL_KEYS={"v1":"YOUR_BASE64_KEY"}`。妥善保管密钥与数据库备份，丢失旧密钥无法读取对应凭据。
 
-SMTP 暂不配置仍可启动并访问 `/health`，真实发码及 `/ready` 返回 503。PUBLIC_BASE_URL 在登录和创建资源阶段可以留空；真实 Telegram 回调需要 HTTPS 公网地址。它是 API 地址，客户页面地址另通过 landing API 设置。
+SMTP 暂不配置仍可启动并访问 `/health`，管理员初始化及 `/admin/login` 可用；普通用户发码及 `/ready` 返回 503。PUBLIC_BASE_URL 在登录和创建资源阶段可以留空；真实 Telegram 回调需要 HTTPS 公网地址。它是 API 地址，客户页面地址另通过 landing API 设置。
 
 ### 数据库选择与配置升级
 
@@ -216,7 +282,7 @@ PostgreSQL 自动建库要求账号具备 CREATEDB 且能够连接维护库；�
 cd auto-register
 if [ ! -f .env ]; then cp .env.example .env; fi
 chmod 600 .env
-# 编辑 DB_*、Redis、HMAC、凭据密钥等运行时变量
+# 填写 ADMIN_EMAIL/ADMIN_PASSWORD、DB_*、Redis、HMAC 和凭据密钥
 # SMTP 可暂时省略
 docker compose config --quiet
 docker compose build telegram-api
@@ -228,7 +294,7 @@ curl http://127.0.0.1:3100/ready
 
 默认宿主机与容器内部均使用 3100，Compose 映射为 `127.0.0.1:3100:3100`。API_PORT 和 PORT 都无需手动配置；API_PORT 仅修改 Compose 的宿主机端口。直接运行镜像时使用 `docker run -p 127.0.0.1:3100:3100 --env-file .env YOUR_IMAGE`。若显式覆盖 PORT，docker run 的映射目标端口也需同步调整。
 
-启动按 DB_TYPE 选择驱动、按 DB_DATABASE 自动建库并初始化八张表和索引，然后连接 Redis、启动 HTTP 和后台队列。设置 DB_AUTO_CREATE_DATABASE=false 时只连接已有库并初始化表/索引。MySQL 还会扩容已知旧凭据列为 TEXT/MEDIUMTEXT，此步骤不加密旧数据，管理员需完成分页迁移。PostgreSQL 使用独立建表 SQL 和 JSONB 字段，队列在两种数据库中都使用事务与 FOR UPDATE SKIP LOCKED。初始化应串行发布。
+启动按 DB_TYPE 选择驱动、按 DB_DATABASE 自动建库并初始化十张表和索引，然后直接初始化管理员、连接 Redis、启动 HTTP 和后台队列。设置 DB_AUTO_CREATE_DATABASE=false 时只连接已有库并初始化表/索引。MySQL 还会扩容已知旧凭据列为 TEXT/MEDIUMTEXT，此步骤不加密旧数据，管理员需完成分页迁移。PostgreSQL 使用独立建表 SQL 和 JSONB 字段，队列在两种数据库中都使用事务与 FOR UPDATE SKIP LOCKED。初始化应串行发布。
 
 容器使用 Node.js 22、非 root 用户、只读根文件系统、临时目录 tmpfs、移除 capabilities、init 和 6 分钟退出宽限。DATA_DIR 卷保留旧迁移兼容用途。Docker HEALTHCHECK 使用 `/health`，SMTP 未配也可运行基础服务；正式流量切换应检查 `/ready`。
 
@@ -252,7 +318,7 @@ node --env-file=.env api/server.js
 
 ## API 清单
 
-请求、响应均为 JSON，POST/PUT 设置 `Content-Type: application/json`，请求体最多 **16 KiB**。同步成功一般返回 200；任务提交与重试返回 202。平台 Token 使用 `Authorization: Bearer <access_token>`；Webhook 与管理员接口分别使用专属凭据。响应包含 `X-Request-ID`，并设置 `Cache-Control: no-store`。
+请求、响应均为 JSON，POST/PUT/PATCH 设置 `Content-Type: application/json`，请求体最多 **16 KiB**。同步成功一般返回 200；任务提交与重试返回 202。平台 Token 使用 `Authorization: Bearer <access_token>`；管理员接口要求管理员角色的会话或独立管理密钥，Webhook 使用专属 Secret。响应包含 `X-Request-ID`，并设置 `Cache-Control: no-store`。
 
 下表 `:id` 为 account_id、`:username` 为 Bot 用户名、`:key` 为 Channel 创建 request_key。所有 `/v1/*` 都要求平台 Token 并检查资源归属。
 
@@ -266,7 +332,7 @@ node --env-file=.env api/server.js
 | POST | `/auth/register/verify` | 无 | challenge_id、code → user、access_token |
 | POST | `/auth/login/start` | 无 | email、password → challenge_id、expires_in |
 | POST | `/auth/login/verify` | 无 | challenge_id、code → user、access_token |
-| GET | `/auth/me` | 平台 Token | 本人 id、email |
+| GET | `/auth/me` | 平台 Token | 本人 id、email、role |
 | POST | `/auth/logout` | 平台 Token | `{}`；撤销当前 Token |
 | POST | `/auth/logout-all` | 平台 Token | `{}`；撤销所有平台会话与旧登录验证 |
 | POST | `/auth/password` | 平台 Token | current_password、new_password；改密并撤销所有平台会话 |
@@ -301,10 +367,21 @@ node --env-file=.env api/server.js
 | 方法 | 路径 | 鉴权 / 参数 |
 | --- | --- | --- |
 | POST | `/webhooks/:bot_id` | Telegram Secret Header；Telegram Update，去重排队后返回 200 |
-| POST | `/admin/credentials/rewrap` | Bearer ADMIN_API_KEY；table、cursor、limit，分页加密或重加密数据库凭据 |
-| PUT | `/admin/users/:user_id/disabled` | Bearer ADMIN_API_KEY；disabled 布尔值，禁用/启用并撤销旧会话 |
+| POST | `/admin/login` | 无需 Token；email、password，直接返回 access_token/expires_in/user，无邮件验证码 |
+| GET | `/admin/users` | 管理员 Bearer；after（UUID 游标）、limit（1–100，默认 50），返回 users/next_cursor |
+| GET | `/admin/users/:user_id` | 管理员 Bearer；用户资料及最多 100 条 Telegram 账号概要，不返回凭据 |
+| PATCH | `/admin/users/:user_id` | 管理员 Bearer；email、password、disabled 中至少一项，仅修改普通用户 |
+| GET | `/admin/audit-logs` | 管理员 Bearer；可选 user_id、before（审计 ID 游标）、limit（1–100），返回 logs/next_cursor |
+| POST | `/admin/credentials/rewrap` | 管理员 Bearer；table、cursor、limit，分页加密或重加密数据库凭据 |
+| PUT | `/admin/users/:user_id/disabled` | 管理员 Bearer；disabled 布尔值，禁用/启用并撤销旧会话 |
 
-Webhook Header 为 `X-Telegram-Bot-Api-Secret-Token`，由注册接口设置。管理员 Token 与平台 Token 相互独立，未配置 ADMIN_API_KEY 时管理员接口不可用。
+Webhook Header 为 `X-Telegram-Bot-Api-Secret-Token`，由注册接口设置。管理员 Bearer 可以是 `/admin/login` 返回的管理员会话，或可选 `ADMIN_API_KEY`。首次身份认证失败时，普通用户会话返回 403，无有效凭据返回 401；同 IP 默认第二次认证失败起封禁 3600 秒并返回 429。普通注册不能授予管理员角色。
+
+修改邮箱、密码或禁用状态均撤销目标用户原有平台会话和未完成的登录验证。只允许修改明确列出的字段；不能借此接口改角色、user_id、资源归属、Telegram 登录态或 Bot Token。管理员自身改密走 `/auth/password`。
+
+所有 `/admin/*` 请求，包括登录、查询、修改、参数错误及权限拒绝，记录在 `audit_logs`：开始/完成 UTC 时间、request_id、操作者类型和 user_id、客户端 IP、连接来源 IP、UA（最多 512 字符）、方法、操作、目标 user_id、HTTP 状态和脱敏变更。邮箱/禁用状态记录修改前后值，密码只记录“已修改”，不记录密码、哈希、Token、Cookie 或原始请求体。成功修改及凭据重加密与审计写入同一事务；审计失败时回滚。查询/拒绝记录无法保存时返回 503。
+
+客户端 IP 默认取连接来源；只有明确配置 `TRUST_PROXY_HOPS` 才读取 `X-Forwarded-For`。部署时限制 API 仅由可信代理访问，并由代理重写转发头。UA 是客户端声明的信息。日志查询只读，不提供删除接口，容量与保留周期由数据库运维管理。
 
 <a id="usage"></a>
 
@@ -316,6 +393,58 @@ Webhook Header 为 `X-Telegram-Bot-Api-Secret-Token`，由注册接口设置。�
 BASE_URL='http://127.0.0.1:3100'
 # 线上使用实际 HTTPS API 地址
 ```
+
+### 管理员后台操作
+
+部署时填入 `ADMIN_EMAIL/ADMIN_PASSWORD`，启动即创建账号，不调用 register 或邮箱验证码接口。管理员登录：
+
+```bash
+curl -X POST "$BASE_URL/admin/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}'
+# 保存响应中的 access_token；expires_in 默认 7200，user.role 为 admin
+ADMIN_TOKEN='YOUR_ADMIN_ACCESS_TOKEN'
+USER_ID='TARGET_USER_UUID'
+curl "$BASE_URL/admin/users?limit=50" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl "$BASE_URL/admin/users/$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+修改普通用户资料，可只传需要修改的字段：
+
+```bash
+curl -X PATCH "$BASE_URL/admin/users/$USER_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"email":"updated@example.com","password":"NEW_USER_PASSWORD","disabled":false}'
+# 响应：{"ok":true,"user":{"id":"...","email":"updated@example.com","role":"user","disabled":false,"created_at":"..."}}
+curl "$BASE_URL/admin/audit-logs?user_id=$USER_ID&limit=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# 有 next_cursor 时用 before=<next_cursor> 继续查询更早日志
+```
+
+`logs` 中每条审计的 id 为字符串，时间为 UTC ISO 格式。例如：
+
+```json
+{
+  "id": "123",
+  "request_id": "REQUEST_UUID",
+  "started_at": "2026-10-05T00:00:00.000Z",
+  "completed_at": "2026-10-05T00:00:00.080Z",
+  "actor_type": "admin",
+  "actor_id": "ADMIN_USER_UUID",
+  "ip": "198.51.100.42",
+  "peer_ip": "10.0.0.1",
+  "user_agent": "AdminConsole/1.0",
+  "method": "PATCH",
+  "action": "users.update",
+  "target_id": "TARGET_USER_UUID",
+  "status": 200,
+  "changes": { "password": { "changed": true } }
+}
+```
+
+IP 封禁响应示例：HTTP 429，Header `Retry-After: 3600`，响应 `{"error":"此 IP 已被暂时禁止访问管理员接口","retry_after":3600}`。后续请求返回剩余秒数；`changes.security` 可记录 `authentication_failed`、`ip_banned`，关联失败或封禁的审计。封禁只限制 `/admin/*`，普通用户 API 和健康检查继续使用原有规则。
+
+管理员账户改密仍使用 `/auth/password`，注销使用 `/auth/logout` 或 `/auth/logout-all`，与普通用户使用相同的会话撤销机制。普通用户注册/登录按以下邮件验证流程执行。
 
 ### 1. 首次注册与后续登录
 
@@ -581,7 +710,7 @@ curl -X PUT "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/token" \
 | 409 | 参数 key 冲突、并发操作或远端结果需核对 |
 | 410 | Telegram 登录流程过期，重新 start |
 | 422 | Telegram 拒绝请求，或需当前未支持的额外认证 |
-| 429 | QPS、冷却、配额或 Telegram 限流；有 Retry-After 时按其等待 |
+| 429 | QPS、冷却、管理员 IP 封禁、配额或 Telegram 限流；有 Retry-After 时按其等待 |
 | 500 | 内部错误，结合 X-Request-ID 查看日志 |
 | 502 / 504 | 远端失败或超时，查询任务并核对结果 |
 | 503 | 必要依赖/配置不可用、旧凭据待迁移或投递队列满 |
@@ -592,7 +721,7 @@ curl -X PUT "$BASE_URL/v1/accounts/$ACCOUNT_ID/bots/$BOT_USERNAME/token" \
 
 ## 升级与生产运行
 
-先备份旧库与密钥，在维护窗口停止旧版本写入。新增 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID/ADMIN_API_KEY，启动新版自动建表和扩容后，用管理员接口分页加密旧凭据：
+先备份旧库与密钥，在维护窗口停止旧版本写入。配置必填 ADMIN_EMAIL/ADMIN_PASSWORD 和 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID，可选配置 ADMIN_API_KEY，启动新版自动建表和扩容后，用管理员接口分页加密旧凭据：
 
 ```bash
 ADMIN_TOKEN='YOUR_ADMIN_API_KEY'
@@ -624,12 +753,12 @@ npm test
 INTEGRATION_TEST=1 TEST_API_URL=http://127.0.0.1:3100 \
   node --env-file=.env --test test/integration.test.js
 SECURITY_INTEGRATION=1 node --env-file=.env --test --test-concurrency=1 \
-  test/database.test.js test/security.test.js test/upgrade.test.js
+  test/database.test.js test/admin.test.js test/security.test.js test/upgrade.test.js
 ```
 
 本地依赖地址与 Docker 地址可能不同，按测试所在网络调整 DB_HOST/REDIS_HOST，REDIS_URL 若已填写仍优先。集成测试应使用独立测试库与 Redis prefix；原鉴权集成需要已运行的同配置 API，安全集成自己启动临时 HTTP 服务。SMTP 测试使用本地接收器，不需要实际外部邮箱。
 
-真实 MySQL/PostgreSQL、Redis 与 HTTP 验证覆盖加密读写、旧凭据迁移、会话撤销、QPS/60 秒冷却、任务持久化/领取/中断恢复/核对、Webhook 去重/429/未知结果重试。Telegram 副作用使用模拟执行器，真实用户登录、BotFather 创建、Channel/帖子、公网 Webhook 和外部 SMTP 投递仍需单独验收。GitHub Actions 仅通过 workflow_dispatch 手动运行，不再由 push 或 pull_request 自动触发；在 Actions → Docker API checks → Run workflow 中选择 main。工作流分别验证 mysql/postgresql 两个后端，MySQL 旧列升级测试仅在 MySQL 执行。构建与单元测试通过不等于已达到线上可用性 SLA。
+真实 MySQL/PostgreSQL、Redis 与 HTTP 验证覆盖管理员初始化/直接登录、用户修改和越权拒绝、Redis IP 封禁（并发计数、TTL 到期与封禁审计）、审计事务回滚与持久化，以及加密读写、旧凭据迁移、会话撤销、QPS/60 秒冷却、任务持久化/领取/中断恢复/核对、Webhook 去重/429/未知结果重试。Telegram 副作用使用模拟执行器，真实用户登录、BotFather 创建、Channel/帖子、公网 Webhook 和外部 SMTP 投递仍需单独验收。GitHub Actions 仅通过 workflow_dispatch 手动运行，不再由 push 或 pull_request 自动触发；在 Actions → Docker API checks → Run workflow 中选择 main。工作流分别验证 mysql/postgresql 两个后端，MySQL 旧列升级测试仅在 MySQL 执行。构建与单元测试通过不等于已达到线上可用性 SLA。
 
 <a id="legacy-card-bot"></a>
 

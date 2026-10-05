@@ -2,11 +2,19 @@
 
 平台账号和个人 Telegram 账号分别认证。先用邮箱、密码和邮件验证码注册平台用户，取得 `access_token`，然后调用 Telegram 登录接口。后续平台登录仍需密码和新的邮件验证码。所有配置从环境变量读取，模板见 [.env.example](.env.example)。
 
+管理员由必填 `ADMIN_EMAIL/ADMIN_PASSWORD` 在启动时直接创建，无需邮箱验证。管理员使用 `POST /admin/login` 提交 email/password 直接获取会话，不发送邮件；普通用户仍按以下邮件验证流程操作。用户管理和审计接口见[主 README](../README.md#api-reference)。
+
+普通 `/auth/login/start`、`/auth/login/verify` 不提供管理员登录。全部 `/admin/*` 接口共享 Redis IP 防爆破：默认同 IP 一小时内累计两次认证失败后封禁 3600 秒，第二次及封禁期间返回 429 和剩余秒数；正确凭据也不能绕过封禁。业务参数错误不计入，成功认证不清零计数，封禁请求不延长 TTL。
+
 ## 环境配置
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | AUTH_HMAC_SECRET | 无，必填 | 至少 32 字符的随机密钥，给邮箱验证码生成 HMAC；可用 `openssl rand -hex 32` 生成 |
+| ADMIN_EMAIL | 无，必填 | 管理员账号邮箱，首次启动直接创建，无需验证邮件 |
+| ADMIN_PASSWORD | 无，必填 | 12–128 字符，仅首次创建时写入密码哈希；重启不覆盖 |
+| ADMIN_AUTH_MAX_FAILURES | 2 | 同一 IP 在计数窗口内管理员认证失败达到此次数时封禁 |
+| ADMIN_IP_BAN_SECONDS | 3600 | 管理员 IP 封禁时长及失败计数窗口，秒 |
 | AUTH_CHALLENGE_TTL_SECONDS | 600 | 注册/登录邮件验证码有效期，范围 60–3600 秒 |
 | AUTH_SESSION_TTL_SECONDS | 7200 | 平台 Bearer 登录态有效期，范围 60–86400 秒 |
 | REDIS_URL | 空 | 如 `redis://:password@redis:6379/0`，优先于分项配置 |
@@ -20,7 +28,7 @@
 | SMTP_REQUIRE_TLS | true | 要求 STARTTLS；仅本地测试邮件服务器可设 false |
 | SMTP_USER / SMTP_PASSWORD | 空 | 服务器要求鉴权时同时填写；可使用邮箱服务的应用密码 |
 
-服务启动时必须连接关系数据库和 Redis。未配置 SMTP 时可以启动，但发送验证码会返回 503，无法注册或登录。生产环境应通过 HTTPS 访问 API。默认按 TCP 来源 IP 限流；可信反向代理后可按实际层数设置 TRUST_PROXY_HOPS，且必须禁止绕过代理。完整新增运行配置见主 README。
+服务启动时必须连接关系数据库和 Redis。未配置 SMTP 时可以启动，管理员可直接登录，但普通用户发送验证码会返回 503，无法完成邮件注册或登录。生产环境应通过 HTTPS 访问 API。默认按 TCP 来源 IP 限流；可信反向代理后可按实际层数设置 TRUST_PROXY_HOPS，且必须禁止绕过代理。完整新增运行配置见主 README。
 
 ## 注册与登录接口
 
@@ -32,7 +40,7 @@
 | POST | /auth/login/verify | challenge_id、code | 返回新的 access_token |
 | POST | /auth/logout-all | 无 | Bearer 鉴权后撤销全部平台会话与旧登录验证 |
 | POST | /auth/password | current_password、new_password | 改密并撤销全部平台会话 |
-| GET | /auth/me | 无 | Bearer 鉴权后返回用户 id、email |
+| GET | /auth/me | 无 | Bearer 鉴权后返回用户 id、email、role |
 | POST | /auth/logout | 无 | Bearer 鉴权后撤销当前登录令牌 |
 | GET | /v1/accounts | 无 | Bearer 鉴权后列出本人保存的 Telegram account_id 和状态 |
 
@@ -62,14 +70,14 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 | 表 | 数据和关系 |
 | --- | --- |
-| user_info | 用户 id、唯一邮箱、密码哈希、注册时间；验证码通过后才创建 |
+| user_info | 用户 id、唯一邮箱、密码哈希、注册时间；普通用户验证码通过后创建，管理员由 env 初始化 |
 | tg_info | account_id、user_id、api_id、api_hash、手机号、MTProto session、登录阶段、待确认验证码信息、待补写创建结果 |
 | bot_info | user_id、account_id、Bot ID、用户名、显示名、Token，以及客户落地页、卡片和 Webhook 配置 |
 | channel_info | user_id、account_id、request_key、Bot/客户关联、Channel ID、access_hash、邀请链接、状态，以及 posts JSON 中的帖子幂等记录 |
 
 关系为 `user_info.id → tg_info.user_id`，以及 `tg_info.account_id → bot_info.account_id / channel_info.account_id`；服务检查这些归属关系，数据库目前通过索引关联，没有外键级联删除。不同用户访问他人的 account_id、Bot 或 Channel 返回 404。customer_id 仅是业务标识，不能代替平台身份。旧共享 API_KEY 不再用于业务鉴权。
 
-服务按 DB_TYPE 选择 MySQL 或 PostgreSQL，自动创建环境变量 `DB_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [MySQL SQL](sql/init.sql) 和 [PostgreSQL SQL](sql/postgresql/init.sql)。DB_AUTO_CREATE_DATABASE=false 可连接已有库，仍初始化表/索引。数据库配置只读取 DB_*。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
+服务按 DB_TYPE 选择 MySQL 或 PostgreSQL，自动创建环境变量 `DB_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [MySQL SQL](sql/init.sql) 和 [PostgreSQL SQL](sql/postgresql/init.sql)。DB_AUTO_CREATE_DATABASE=false 可连接已有库，仍初始化表/索引。数据库配置只读取 DB_*。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries、user_admins、audit_logs，共十张表。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
 
 ## 旧 JSON 会话迁移
 

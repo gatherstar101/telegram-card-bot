@@ -3,6 +3,8 @@ import { postgresTables } from './postgres-schema.js';
 import { tables } from './schema.js';
 import { credentials } from './security.js';
 import { Failure } from './errors.js';
+import { randomUUID } from 'node:crypto';
+import { publicUser } from './admin.js';
 
 export async function createStore(env = process.env) {
   const crypt=credentials(env);
@@ -22,13 +24,72 @@ export async function createStore(env = process.env) {
     if (!account) throw new Error('Unknown Telegram account');
     return account.user_id;
   };
-  const userQuery=`SELECT u.id,u.email,u.password_hash,COALESCE(s.disabled,${type==='postgresql'?'FALSE':'0'}) AS disabled,COALESCE(s.auth_version,0) AS auth_version FROM user_info u LEFT JOIN user_security s ON ${type==='postgresql'?'s.user_id=u.id':'s.user_id COLLATE utf8mb4_unicode_ci=u.id'}`;
+  const userQuery=`SELECT u.id,u.email,u.password_hash,u.created_at,CASE WHEN a.user_id IS NULL THEN 'user' ELSE 'admin' END AS role,COALESCE(s.disabled,${type==='postgresql'?'FALSE':'0'}) AS disabled,COALESCE(s.auth_version,0) AS auth_version FROM user_info u LEFT JOIN user_security s ON ${type==='postgresql'?'s.user_id=u.id':'s.user_id COLLATE utf8mb4_unicode_ci=u.id'} LEFT JOIN user_admins a ON ${type==='postgresql'?'a.user_id=u.id':'a.user_id COLLATE utf8mb4_unicode_ci=u.id'}`;
   const insensitive=column=>type==='postgresql'?`LOWER(${column})=LOWER(?)`:`${column}=?`;
   const versionConflict=conflict(type,'user_security',['user_id'],[],['auth_version=user_security.auth_version+1']);
   const transaction=async action=>{const connection=await pool.getConnection();try{await connection.beginTransaction();const value=await action(connection);await connection.commit();return value;}catch(error){await connection.rollback();throw error;}finally{connection.release();}};
   const decryptBot=row=>row&&{...row,token:crypt.open(row.token,`bot:${row.telegram_bot_id}:token`),...(row.webhook_secret?{webhook_secret:crypt.open(row.webhook_secret,`bot:${row.telegram_bot_id}:webhook_secret`)}:{})};
+  const appendAudit = (context, connection=pool) => connection.execute(`INSERT INTO audit_logs
+    (request_id,started_at,completed_at,actor_type,actor_id,ip,peer_ip,user_agent,method,action,target_id,status,changes)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, [context.request_id,context.started_at,Date.now(),context.actor_type,context.actor_id??null,
+      context.ip,context.peer_ip,context.user_agent,context.method,context.action,context.target_id??null,context.status,JSON.stringify(context.changes||{})]);
+  const checkActor = async(connection, context) => {
+    if(context.actor_type==='api_key')return;
+    const [users]=await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[context.actor_id]);
+    const [admins]=await connection.execute('SELECT user_id FROM user_admins WHERE user_id=?',[context.actor_id]);
+    const [security]=await connection.execute('SELECT disabled,auth_version FROM user_security WHERE user_id=?',[context.actor_id]);
+    if(!users.length||!admins.length||Boolean(Number(security[0]?.disabled))||Number(security[0]?.auth_version||0)!==context.actor_auth_version)throw new Failure(401,'管理员登录状态已撤销');
+  };
   return {
     pool, transaction, type, ready:()=>pool.execute('SELECT 1'),
+    appendAudit,
+    async initializeAdmin(user) {
+      const initialize=()=>transaction(async connection=>{
+        const [existing]=await connection.execute(`SELECT id FROM user_info WHERE ${insensitive('email')} FOR UPDATE`,[user.email]);
+        if(existing.length){
+          const [admins]=await connection.execute('SELECT user_id FROM user_admins WHERE user_id=?',[existing[0].id]);
+          if(!admins.length)throw new Error('ADMIN_EMAIL 已属于普通用户，不能自动提升为管理员');
+          return {created:false,id:existing[0].id};
+        }
+        await connection.execute('INSERT INTO user_info(id,email,password_hash) VALUES(?,?,?)',[user.id,user.email,user.password_hash]);
+        await connection.execute('INSERT INTO user_admins(user_id) VALUES(?)',[user.id]);
+        await appendAudit({request_id:randomUUID(),started_at:Date.now(),actor_type:'bootstrap',actor_id:user.id,ip:'',peer_ip:'',user_agent:'',method:'STARTUP',action:'admin.bootstrap',target_id:user.id,status:200,changes:{role:{after:'admin'}}},connection);
+        return {created:true,id:user.id};
+      });
+      let result;
+      for(let attempt=0;attempt<3;attempt++){
+        try{result=await initialize();break;}catch(error){if(attempt===2||!['ER_DUP_ENTRY','23505','ER_LOCK_DEADLOCK','40P01'].includes(error.code))throw error;}
+      }
+      return {created:result.created,user:publicUser(await this.userById(result.id))};
+    },
+    async adminUsers(after,limit){const [rows]=await pool.execute(userQuery+' WHERE u.id>? ORDER BY u.id LIMIT ?',[after,limit]);return rows;},
+    async adminUpdateUser(id,patch,context){
+      try{return await transaction(async connection=>{
+        await checkActor(connection,context);
+        const [rows]=await connection.execute('SELECT id,email,password_hash,created_at FROM user_info WHERE id=? FOR UPDATE',[id]);
+        if(!rows.length)throw new Failure(404,'用户不存在');
+        const [admins]=await connection.execute('SELECT user_id FROM user_admins WHERE user_id=?',[id]);
+        if(admins.length)throw new Failure(403,'此接口仅修改普通用户，管理员改密请使用 /auth/password');
+        const [states]=await connection.execute('SELECT disabled FROM user_security WHERE user_id=?',[id]);
+        const before={...rows[0],role:'user',disabled:Boolean(Number(states[0]?.disabled))};
+        const assignments=[];const args=[];const changes={};
+        if(Object.hasOwn(patch,'email')){assignments.push('email=?');args.push(patch.email);changes.email={before:before.email,after:patch.email};}
+        if(Object.hasOwn(patch,'password_hash')){assignments.push('password_hash=?');args.push(patch.password_hash);changes.password={changed:true};}
+        if(assignments.length)await connection.execute(`UPDATE user_info SET ${assignments.join(',')} WHERE id=?`,[...args,id]);
+        const disabled=patch.disabled??before.disabled;
+        if(Object.hasOwn(patch,'disabled'))changes.disabled={before:before.disabled,after:disabled};
+        await connection.execute('INSERT INTO user_security(user_id,disabled,auth_version) VALUES(?,?,1)'+conflict(type,'user_security',['user_id'],['disabled'],['auth_version=user_security.auth_version+1']),[id,disabled]);
+        await appendAudit({...context,status:200,changes},connection);
+        return publicUser({...before,email:patch.email??before.email,disabled});
+      });}catch(error){if(['ER_DUP_ENTRY','23505'].includes(error.code))throw new Failure(409,'该邮箱已被其他用户使用');throw error;}
+    },
+    async auditLogs(before,target,limit){
+      const filters=[];const args=[];
+      if(before){filters.push('id<?');args.push(before);}
+      if(target){filters.push('target_id=?');args.push(target);}
+      const [rows]=await pool.execute(`SELECT * FROM audit_logs${filters.length?' WHERE '+filters.join(' AND '):''} ORDER BY id DESC LIMIT ?`,[...args,limit]);
+      return rows.map(row=>({...row,id:String(row.id),started_at:new Date(Number(row.started_at)).toISOString(),completed_at:new Date(Number(row.completed_at)).toISOString(),changes:json(row.changes)}));
+    },
     async revokeSessions(id){await pool.execute('INSERT INTO user_security(user_id,auth_version) VALUES(?,1)'+versionConflict,[id]);},
     async disableUser(id,disabled){if(!await one('SELECT id FROM user_info WHERE id=?',[id]))throw new Failure(404,'用户不存在');await pool.execute('INSERT INTO user_security(user_id,disabled,auth_version) VALUES(?,?,1)'+conflict(type,'user_security',['user_id'],['disabled'],['auth_version=user_security.auth_version+1']),[id,disabled]);},
     changePassword:(id,hash)=>transaction(async connection=>{await connection.execute('UPDATE user_info SET password_hash=? WHERE id=?',[hash,id]);await connection.execute('INSERT INTO user_security(user_id,auth_version) VALUES(?,1)'+versionConflict,[id]);}),
@@ -92,17 +153,22 @@ export async function createStore(env = process.env) {
       await pool.execute('INSERT INTO bot_info (user_id,account_id,telegram_bot_id,username,name,token) VALUES (?,?,?,?,?,?)',
         [await ownedUser(id),id,bot.token.split(':')[0],bot.username,bot.name,crypt.seal(bot.token,`bot:${bot.token.split(':')[0]}:token`)]);
     },
-    async rewrap(table,cursor='',limit=50) {
+    async rewrap(table,cursor='',limit=50,context=null) {
       if(!['tg_info','bot_info'].includes(table)||typeof cursor!=='string'||cursor.length>64||!Number.isInteger(limit)||limit<1||limit>100)throw new Failure(400,'迁移参数无效');
       const key=table==='tg_info'?'account_id':'telegram_bot_id';
       const selected=table==='tg_info'?fields:['token','webhook_secret'];
-      const [rows]=await pool.query(`SELECT * FROM ${table} WHERE ${key}>? ORDER BY ${key} LIMIT ?`,[cursor|| (table==='bot_info'?'0':''),limit]);
+      const run=async connection=>{
+      if(context)await checkActor(connection,context);
+      const [rows]=await connection.query(`SELECT * FROM ${table} WHERE ${key}>? ORDER BY ${key} LIMIT ?`,[cursor|| (table==='bot_info'?'0':''),limit]);
       const legacy=credentials(env,{allowPlaintext:true});let changed=0;
       for(const row of rows){const updates=[];const values=[];const before=[];
         for(const field of selected){if(row[field]===null)continue;const context=`${table==='tg_info'?'tg':'bot'}:${row[key]}:${field}`;const raw=typeof row[field]==='object'?JSON.stringify(row[field]):row[field];if(crypt.current(raw))continue;updates.push(`${field}=?`);values.push(crypt.seal(legacy.open(raw,context),context));before.push(row[field]);}
-        if(updates.length){const columns=updates.map(v=>v.split('=')[0]);const [result]=await pool.execute(`UPDATE ${table} SET updated_at=CURRENT_TIMESTAMP,${updates.join(',')} WHERE ${key}=? AND ${columns.map(c=>`${c}${type==='postgresql'?' IS NOT DISTINCT FROM ':'<=>'}?`).join(' AND ')}`,[...values,row[key],...before]);changed+=result.affectedRows;}
+        if(updates.length){const columns=updates.map(v=>v.split('=')[0]);const [result]=await connection.execute(`UPDATE ${table} SET updated_at=CURRENT_TIMESTAMP,${updates.join(',')} WHERE ${key}=? AND ${columns.map(c=>`${c}${type==='postgresql'?' IS NOT DISTINCT FROM ':'<=>'}?`).join(' AND ')}`,[...values,row[key],...before]);changed+=result.affectedRows;}
       }
+      if(context)await appendAudit({...context,status:200,changes:{table,changed}},connection);
       return {changed,next_cursor:rows.length?String(rows.at(-1)[key]):cursor,done:rows.length<limit};
+      };
+      return context?transaction(run):run(pool);
     },
     close:()=>pool.end(),
   };

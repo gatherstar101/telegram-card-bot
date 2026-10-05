@@ -6,8 +6,8 @@
 
 在维护窗口停止旧版本写入，备份关系数据库、Redis 和密钥。记录当前镜像与配置，先在测试库恢复和演练升级。
 
-1. 数据库配置统一重命名为 DB_*，不再读取旧前缀；保留对应值、Redis、AUTH_HMAC_SECRET、REDIS_KEY_PREFIX，新增 CREDENTIAL_KEYS、CREDENTIAL_KEY_ID，以及迁移所需 ADMIN_API_KEY。
-2. 启动新版。服务创建环境变量指定的数据库、八张表，MySQL 还会按 information_schema 扩容旧凭据字段为 TEXT/MEDIUMTEXT。需要 ALTER 权限；此步骤不加密旧数据。
+1. 数据库配置统一重命名为 DB_*，不再读取旧前缀；保留对应值、Redis、AUTH_HMAC_SECRET、REDIS_KEY_PREFIX，配置必填 ADMIN_EMAIL、ADMIN_PASSWORD、CREDENTIAL_KEYS、CREDENTIAL_KEY_ID，以及可选独立管理凭据 ADMIN_API_KEY。
+2. 启动新版。服务创建环境变量指定的数据库、十张表，MySQL 还会按 information_schema 扩容旧凭据字段为 TEXT/MEDIUMTEXT。需要 ALTER 权限；此步骤不加密旧数据。
 3. 管理员 POST /admin/credentials/rewrap，table=tg_info、cursor=""、limit=50，按 next_cursor 翻页至 done=true；然后处理 bot_info。每批最多 100 行，不返回凭据。
 4. 调用方把创建和核对请求改为 202 后查询 /v1/accounts/:id/jobs/:job_id。成功后读取 result，失败查看 error。
 5. 检查 ready 与真实业务闭环后恢复流量。SMTP 未配时 ready=503，但 health=200，可进行基础验证。
@@ -84,3 +84,13 @@ health 只检查可响应；ready 检查必要邮件配置和关系数据库/Red
 SIGTERM 停止新请求和轮询，等待活动任务完成再关闭依赖；Compose stop_grace_period 为 6 分钟。强制终止会等待租约过期恢复。不要用容器 restart 来更新 .env，使用 compose up 重建容器。
 
 容量测试覆盖多个 API 副本、同手机号并发、数据库死锁/不可用、Redis 故障与重启、慢 SMTP、队列填满和未知远端结果。使用模拟 Telegram，不能对真实发码/创建资源做高频压测。当前单实例关系数据库、Redis、SMTP 的高可用部署与外部服务可用性仍需运维提供；本仓库不构建依赖集群，也不承诺线上 SLA。
+
+## 管理员与审计
+
+默认同 IP 在 3600 秒内累计两次管理员认证失败，Redis 原子封禁全部 /admin/* 接口 3600 秒。第二次失败及封禁期间返回 429 与 Retry-After/retry_after；正确凭据不能绕过，访问不会延长封禁，成功认证不清零计数。业务参数及通过管理员认证后的资源权限错误不计数。ADMIN_AUTH_MAX_FAILURES 和 ADMIN_IP_BAN_SECONDS 为运行时配置，默认 2/3600；多副本保持一致并共享 Redis prefix。Redis 校验不可用时拒绝管理请求并返回 503，失败与封禁仍写入审计。
+
+ADMIN_EMAIL/ADMIN_PASSWORD 均为必填运行时配置；启动直接创建管理员，创建和 /admin/login 均不需要邮件验证码及 SMTP。已有管理员重启不覆盖密码，普通邮箱冲突不会自动提升角色。普通用户鉴权仍依赖邮件验证码，SMTP 缺失时 /ready 返回 503。
+
+用户管理接口仅修改普通用户邮箱、密码和启停状态，并撤销旧会话；管理员自身改密使用 /auth/password。资料修改、凭据重加密和成功审计同一事务，审计写入失败时回滚。所有管理请求的成功、拒绝和失败均保存 UTC 时间、request_id、操作者、目标用户、IP、连接来源 IP、UA 与脱敏变更；不保存密码、哈希或 Token。查询/拒绝审计无法写入时返回 503。
+
+TRUST_PROXY_HOPS 仅在可信代理入口设置，限制直连并由代理重写转发头。audit_logs 查询按 ID 分页，只提供读取接口；容量与保留周期由数据库运维管理。初始化日志操作者为 bootstrap，无 HTTP IP/UA；独立密钥调用标记为 api_key。接口及完整示例见[主 README](../README.md#api-reference)。

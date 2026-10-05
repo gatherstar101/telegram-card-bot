@@ -48,6 +48,8 @@ jobs:
       CREDENTIAL_KEY_ID: v1
       CREDENTIAL_KEYS: '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
       ADMIN_API_KEY: integration-admin-secret-longer-than-32-characters
+      ADMIN_EMAIL: admin@example.test
+      ADMIN_PASSWORD: integration-admin-password
       PORT: 3100
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -62,7 +64,7 @@ jobs:
       - run: npm test
         working-directory: auto-register
       - name: SQL and Redis security and upgrade tests
-        run: node --test --test-concurrency=1 test/database.test.js test/security.test.js test/upgrade.test.js
+        run: node --test --test-concurrency=1 test/database.test.js test/admin.test.js test/security.test.js test/upgrade.test.js
         working-directory: auto-register
         env:
           SECURITY_INTEGRATION: '1'

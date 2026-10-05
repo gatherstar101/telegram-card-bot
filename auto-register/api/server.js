@@ -10,13 +10,14 @@ import { Jobs,jobContext } from './jobs.js';
 import { Deliveries } from './deliveries.js';
 import { background } from './queue-store.js';
 import { integer,audit,validateConfig } from './security.js';
+import { bootstrapAdmin } from './admin.js';
 
 process.umask(0o077);
 const env=process.env;
 validateConfig(env);
 const store=await createStore(env);
 let auth;
-try{auth=await createAuthRuntime(store,env);}catch(error){await store.close();throw error;}
+try{const admin=await bootstrapAdmin(store,env);if(admin.created)audit('admin_initialized',{user_id:admin.user.id});auth=await createAuthRuntime(store,env);}catch(error){await store.close();throw error;}
 async function connected(state,operation){
   const client=new TelegramClient(new StringSession(state.session||''),state.api_id,state.api_hash,{connectionRetries:2,requestRetries:2,autoReconnect:false,receiveUpdates:false,floodSleepThreshold:0});client.setLogLevel('none');
   const seconds=jobContext.getStore()?integer(env,'JOB_TIMEOUT_SECONDS',240,30,240):integer(env,'TELEGRAM_TIMEOUT_SECONDS',60,15,240);let timer;

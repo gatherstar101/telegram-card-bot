@@ -1,4 +1,16 @@
 export const tables = [
+  `CREATE TABLE IF NOT EXISTS user_admins (
+    user_id CHAR(36) NOT NULL PRIMARY KEY
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    request_id CHAR(36) NOT NULL, started_at BIGINT NOT NULL, completed_at BIGINT NOT NULL,
+    actor_type VARCHAR(16) NOT NULL, actor_id CHAR(36) NULL,
+    ip VARCHAR(64) NOT NULL, peer_ip VARCHAR(64) NOT NULL, user_agent VARCHAR(512) NOT NULL,
+    method VARCHAR(8) NOT NULL, action VARCHAR(64) NOT NULL, target_id CHAR(36) NULL,
+    status INT NOT NULL, changes JSON NOT NULL,
+    KEY ix_audit_target (target_id,id), KEY ix_audit_time (completed_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   `CREATE TABLE IF NOT EXISTS user_info (
     id CHAR(36) NOT NULL PRIMARY KEY,
     email VARCHAR(254) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,

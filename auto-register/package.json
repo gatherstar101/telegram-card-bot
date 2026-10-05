@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/errors.js && node --check api/auth.js && node --check api/auth-runtime.js && node --check scripts/assign-account.js && node --check api/schema.js && node --check api/security.js && node --check api/cache.js && node --check api/app.js && node --check api/jobs.js && node --check api/deliveries.js && node --check api/queue-store.js && node --check api/database.js && node --check api/postgres-schema.js",
+    "check": "node --check scripts/create-bot.js && node --check api/server.js && node --check api/store.js && node --check api/conversion.js && node --check api/errors.js && node --check api/auth.js && node --check api/auth-runtime.js && node --check api/admin.js && node --check scripts/assign-account.js && node --check api/schema.js && node --check api/security.js && node --check api/cache.js && node --check api/app.js && node --check api/jobs.js && node --check api/deliveries.js && node --check api/queue-store.js && node --check api/database.js && node --check api/postgres-schema.js",
     "create:bot": "node scripts/create-bot.js",
     "start:api": "node api/server.js",
     "test": "node --test test/*.test.js",
