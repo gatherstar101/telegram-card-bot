@@ -12,6 +12,7 @@
 
 - [统一开通与发布](#product-flow)
 - [架构、身份与数据](#architecture)
+- [数据库、表结构与 SQL / DDL](#database-ddl)
 - [管理员与保留方案](#special-case)
 - [运行时环境变量](#configuration)
 - [Docker 构建与部署](#build-and-verify)
@@ -65,25 +66,7 @@ flowchart LR
 
 API 接收操作并持久化任务，后台轮询数据库队列，使用事务与租约领取任务。多个副本共享同一个数据库和 Redis，通过 Redis 按手机号、用户或 Bot 协调操作。Telegram 连接仅在需要时建立，结束后保存 StringSession 并关闭，不要求永久在线 TCP 客户端。
 
-| 表 | 内容 |
-| --- | --- |
-| `user_info` | UUID、唯一邮箱和 scrypt 密码哈希 |
-| `tg_info` | 用户归属、account_id、App 凭据、手机号、StringSession 和恢复状态 |
-| `bot_info` | Bot 信息与 Token、客户卡片、落地页和 Webhook 配置 |
-| `channel_info` | Channel 创建 key、频道 ID/access_hash、邀请链接及旧帖子 JSON |
-| `user_security` | 用户禁用标记与会话撤销版本 |
-| `user_admins` | 管理员角色归属，普通用户注册不能写入 |
-| `audit_logs` | 管理员操作时间、身份、IP、UA、目标用户、结果及脱敏变更 |
-| `telegram_apps` / `account_profiles` | 用户 App 配置与账号使用的配置版本 |
-| `telegram_identities` / `telegram_phone_claims` | 认证后的 Telegram 身份及手机号绑定 |
-| `user_business` / `user_limits` | 业务授权版本、停用原因与用户配额覆盖 |
-| `project_info` / `project_versions` / `project_resources` | 项目、不可变配置版本与环境资源 |
-| `workflow_runs` / `workflow_steps` | 开通/发布流程、进度、步骤与任务关系 |
-| `telegram_visitors` / `business_events` | 访客资料、原始更新与转化事件 |
-| `business_dispatches` | 已批准远端操作、完成结果与未知状态 |
-| `channel_posts` | 新帖子独立记录、random_id 和发送状态 |
-| `api_jobs` | 持久化创建/核对任务、检查点、租约与结果 |
-| `webhook_deliveries` | update_id 去重、卡片投递状态和重试时间 |
+关系数据库共 24 张表，完整表名、主键、用途和 DDL 文件见[数据库与 SQL 说明](#database-ddl)。所有用户共用这些表，通过用户、账号和项目归属隔离。
 
 手机号、api_hash、session、phone_code_hash、恢复凭据、Bot Token 和 Webhook Secret 使用 AES-256-GCM 加密。任务载荷/结果和投递载荷也加密，密文绑定记录与字段。密码只存哈希。Redis 保存邮件 OTP、平台会话、限流和锁；Telegram 登录态在关系数据库，不需要 tgsession.blob 或 JSON 文件即可跨容器重启恢复。
 
@@ -117,6 +100,101 @@ auto-register/
   test/                     单元与可选真实 MySQL/PostgreSQL 与 Redis 集成验证
 card-bot/                   已弃用 / 不可用，仅归档历史源码
 ```
+
+<a id="database-ddl"></a>
+
+## 数据库、表结构与 SQL / DDL
+
+### 自定义库名与自动初始化
+
+数据库名由容器运行时 `DB_DATABASE` 指定，表名固定，不支持自定义表名或表名前缀。不会按用户单独建库或建表。
+
+```dotenv
+DB_TYPE=mysql
+DB_DATABASE=telegram_test
+DB_AUTO_CREATE_DATABASE=true
+```
+
+DB_TYPE 支持 mysql 和 postgresql；DB_DATABASE 仅允许字母、数字、下划线，MySQL 最长 64 字符，PostgreSQL 最长 63 字符。更换库名会连接另一个库，不自动复制旧数据；更换 DB_TYPE 也不会跨引擎迁移数据。
+
+`DB_AUTO_CREATE_DATABASE=true` 时启动自动建库，随后初始化 24 张表及索引。MySQL 需要建库权限；PostgreSQL 需要 CREATEDB 和维护库连接权限。已有库可设置 false，跳过建库，仍初始化表/索引。MySQL 旧凭据列扩容和已知缺失产品列升级还需要 ALTER 权限。数据库账号同时需要业务读写权限，完整连接/TLS 设置见[环境变量](#configuration)。
+
+### 完整表名与用途
+
+| 表名 | 主键 | 用途 |
+| --- | --- | --- |
+| `user_info` | id | 平台用户、唯一邮箱、密码哈希、注册时间 |
+| `user_admins` | user_id | 管理员角色，与用户资料分开保存 |
+| `user_security` | user_id | disabled 软禁用标记、auth_version 会话撤销版本 |
+| `user_business` | user_id | epoch 业务授权版本、停用原因 |
+| `user_limits` | user_id | 用户资源/并发配额覆盖 |
+| `audit_logs` | id（自增） | 管理操作时间、操作者、IP、UA、目标用户、结果及脱敏变更 |
+| `telegram_apps` | id | 自有 api_id、加密 api_hash、App 配置版本 |
+| `tg_info` | account_id | 用户归属、Telegram 凭据、加密 Session、认证和恢复状态 |
+| `account_profiles` | account_id | 账号使用的 app_config_id 和 app_version |
+| `telegram_identities` | telegram_user_id | 认证后的 Telegram 数字身份、平台用户与账号绑定 |
+| `telegram_phone_claims` | phone_key | 认证后的手机号 SHA-256 摘要与账号绑定 |
+| `bot_info` | id（自增） | Bot ID/用户名、加密 Token、客户卡片和 Webhook |
+| `channel_info` | account_id + request_key | Channel ID/access_hash、邀请链接、创建状态、旧帖子 JSON |
+| `channel_posts` | account_id + channel_key + request_key | 帖子正文、链接、random_id 和发送结果 |
+| `project_info` | id | 项目归属、状态、授权版本、草稿/验收/发布版本、活动流程 |
+| `project_versions` | project_id + version | 不可变的加密项目配置快照 |
+| `project_resources` | project_id + environment + kind | 项目 test/production 环境的 Bot/Channel 资源绑定 |
+| `workflow_runs` | id | 开通与发布流程、执行状态、授权版本、租约及调度时间 |
+| `workflow_steps` | workflow_id + position | 分步进度、job_id、重试次数、时间和错误 |
+| `api_jobs` | id（64 字符摘要） | 底层创建/核对任务、幂等参数、检查点、租约与结果 |
+| `webhook_deliveries` | bot_id + update_id | Telegram Update 去重、加密投递载荷、状态和重试 |
+| `telegram_visitors` | bot_id + telegram_user_id | 加密访客资料、首次/最近出现时间 |
+| `business_events` | id | 来源、启动、投递、跳转、成交回传及加密原始更新 |
+| `business_dispatches` | id | 派发许可、操作类型、开始/完成时间和结果状态 |
+
+### DDL 设计
+
+DDL（Data Definition Language）是定义数据库结构的 SQL：`CREATE TABLE` 建表，`CREATE INDEX` 建索引，`ALTER TABLE` 升级已有列。它不同于插入业务数据；管理员初始化与凭据加密由应用完成。
+
+- 身份与关联：平台 user_id、account_id、project_id、workflow_id 使用 UUID 字符串；数据库列使用 CHAR/VARCHAR，并未使用 PostgreSQL 原生 UUID 类型。多条记录通过 user_id、account_id、project_id 等字段关联，当前没有数据库外键或级联删除，归属检查由应用完成。
+- 唯一性：邮箱、Bot ID/用户名、Telegram 数字身份绑定和事件 event_key 等设唯一约束；配置版本、流程步骤、帖子及投递使用联合主键，避免相同业务键重复记录。
+- 索引：用户资源查询索引加速归属查询；任务和流程的 status/next_at 索引用于后台领取；事件及审计索引支持用户、项目、时间查询。
+- 状态与版本：disabled 使用 BOOLEAN，MySQL 对应 0/1，PostgreSQL 对应 false/true；项目/任务状态使用 VARCHAR，由应用校验。auth_version 撤销登录会话，epoch 撤销业务授权，draft/tested/published_version 管理发布版本。
+- 敏感数据：密码保存 scrypt 哈希。App hash、手机号、Session、Bot Token、Webhook Secret、任务/投递载荷及详细访客/事件数据由应用执行 AES-256-GCM 加密，存入 TEXT/MEDIUMTEXT；列类型本身不会自动加密数据。并非所有字段都加密，详见各表定义。
+- 类型与时间：MySQL 使用 InnoDB、utf8mb4，以及 JSON、TEXT/MEDIUMTEXT；PostgreSQL 使用对应的 JSONB、TEXT 和 identity 自增列。业务调度、流程与事件时间使用 BIGINT 毫秒时间戳，部分核心记录的 created_at/updated_at 使用 TIMESTAMP/TIMESTAMPTZ。
+
+例如 MySQL 的软禁用表：
+
+```sql
+CREATE TABLE IF NOT EXISTS user_security (
+    user_id CHAR(36) PRIMARY KEY,
+    disabled BOOLEAN NOT NULL DEFAULT FALSE,
+    auth_version BIGINT NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+PostgreSQL 对应 user_id 为 VARCHAR(36)，不使用 ENGINE/CHARSET 子句。API 统一提交 `disabled` 布尔值；业务停用还同步更新 user_business、队列和流程，不能只直接修改这一列来代替管理接口。
+
+### SQL 文件与执行方式
+
+| 文件 | 用途 |
+| --- | --- |
+| [MySQL init.sql](auto-register/sql/init.sql) | 新库完整 24 张表及索引 |
+| [PostgreSQL init.sql](auto-register/sql/postgresql/init.sql) | 新库完整 24 张表及索引，使用 PostgreSQL 方言 |
+| [MySQL 002-security.sql](auto-register/sql/002-security.sql) | 旧凭据字段扩容与安全/队列辅助表，不是完整新库初始化 |
+| [MySQL 003-product.sql](auto-register/sql/003-product.sql) | 新增 14 张产品表及索引，不包含原有十张表 |
+| [PostgreSQL 003-product.sql](auto-register/sql/postgresql/003-product.sql) | 新增 14 张产品表及索引，使用 PostgreSQL 方言 |
+
+正常部署由服务自动初始化，不必再手动执行 SQL。运行时定义位于 api/schema.js、api/postgres-schema.js 和 api/product-schema.js。启动使用 IF NOT EXISTS 建表并检查索引，仅升级代码中明确列出的旧字段；它不是通用 schema 同步工具，不会自动把任意旧表改为新表定义，也不删除现有业务数据。
+
+需要手动初始化时，先创建目标数据库，再选择对应引擎的完整 init.sql。SQL 文件不写死库名，也不负责 CREATE DATABASE。以下命令在仓库根目录执行，DB_HOST、DB_PORT、DB_USER、DB_DATABASE 为调用方设置的连接变量；密码由客户端交互提示输入：
+
+```bash
+# MySQL；DB_PORT 留空时用 3306
+mysql -h "$DB_HOST" -P "${DB_PORT:-3306}" -u "$DB_USER" -p \
+  -D "$DB_DATABASE" < auto-register/sql/init.sql
+# PostgreSQL；DB_PORT 留空时用 5432；ON_ERROR_STOP 在 SQL 错误时停止
+psql -h "$DB_HOST" -p "${DB_PORT:-5432}" -U "$DB_USER" -W \
+  -d "$DB_DATABASE" -v ON_ERROR_STOP=1 -f auto-register/sql/postgresql/init.sql
+```
+
+init.sql 已包含产品表，新库无需再执行 003-product.sql。MySQL 手动文件的产品索引使用普通 CREATE INDEX，重复执行可能报索引已存在；服务启动会查询已有索引并跳过。PostgreSQL 索引使用 IF NOT EXISTS。ALTER 升级和建索引不意味着完整脚本可以事务回滚；旧库升级前备份，并按[生产升级说明](auto-register/PRODUCTION.md)执行。扩容旧字段不会把明文自动变成密文，仍需要管理员分页 rewrap。
 
 <a id="special-case"></a>
 

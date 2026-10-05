@@ -64,6 +64,10 @@ Compose 仅创建 API 容器，连接已有关系数据库/Redis。默认宿主�
 
 项目资源的 landing/webhook 写操作必须通过版本发布流程，直接调用底层接口返回 409。独立资源仍可使用 Bot/Channel/帖子底层接口，见 [CONVERSION.md](CONVERSION.md)。所有资源路径检查归属。验证码由用户接收后提交，本服务不读取客户端验证码。完整 curl 和响应见[使用示例](../README.md#usage)。
 
+## 数据库与 SQL
+
+库名通过运行时 DB_DATABASE 自定义，表名固定，不提供表前缀配置；所有用户共用 24 张表并检查资源归属。服务启动自动建表和检查索引，DB_AUTO_CREATE_DATABASE=false 只跳过建库。完整表名、主键、DDL 设计、五个 SQL 文件的用途和手动执行示例见[主 README 的 SQL 说明](../README.md#database-ddl)。
+
 ## 持久化、退出与升级
 
 用户软启停字段为 user_security.disabled，MySQL 0/1、PostgreSQL false/true，API 统一用布尔值。禁用撤销会话、取消积压、挂起流程并拦截新业务派发；恢复后重新登录并明确恢复，不自动重放。已批准的在途请求可能完成，历史 Telegram 消息和频道成员不自动清理。项目归档保留数据，不可恢复。
