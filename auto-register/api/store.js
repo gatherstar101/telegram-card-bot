@@ -5,6 +5,8 @@ import { credentials } from './security.js';
 import { Failure } from './errors.js';
 import { randomUUID } from 'node:crypto';
 import { publicUser } from './admin.js';
+import { productTables } from './product-schema.js';
+import { installProductStore } from './product-store.js';
 
 export async function createStore(env = process.env) {
   const crypt=credentials(env);
@@ -12,6 +14,13 @@ export async function createStore(env = process.env) {
   const {pool,type,database}=await createDatabase(env);
   try {
     for (const sql of type==='postgresql'?postgresTables:tables) await pool.execute(sql);
+    for (const entry of productTables(type)) {
+      if(typeof entry==='string')await pool.execute(entry);
+      else {const [indexes]=await pool.execute('SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME=?',[database,entry.table,entry.name]);if(!indexes.length)try{await pool.execute(entry.sql);}catch(error){if(error.code!=='ER_DUP_KEYNAME')throw error;}}
+    }
+    for(const [table,column,definition] of [['project_info','epoch','BIGINT NOT NULL DEFAULT 0'],['project_resources','version','INT NOT NULL DEFAULT 1'],['workflow_runs','project_epoch','BIGINT NOT NULL DEFAULT 0'],['business_events','version','INT NULL']]) {
+      const [columns]=await pool.execute('SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=? AND column_name=?',[type==='mysql'?database:'public',table,column]);if(!columns.length)await pool.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
     if(type==='mysql')for(const [table,column,definition] of [['tg_info','api_hash','TEXT NOT NULL'],['tg_info','phone','TEXT NOT NULL'],['tg_info','phone_code_hash','TEXT NULL'],['tg_info','pending_bot','MEDIUMTEXT NULL'],['tg_info','pending_channel','MEDIUMTEXT NULL'],['bot_info','token','TEXT NOT NULL'],['bot_info','webhook_secret','TEXT NULL']]) {
       const [rows]=await pool.execute('SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?',[database,table,column]);
       if(!['text','mediumtext','longtext'].includes(rows[0]?.DATA_TYPE))await pool.query(`ALTER TABLE ${table} MODIFY ${column} ${definition}`);
@@ -40,7 +49,7 @@ export async function createStore(env = process.env) {
     const [security]=await connection.execute('SELECT disabled,auth_version FROM user_security WHERE user_id=?',[context.actor_id]);
     if(!users.length||!admins.length||Boolean(Number(security[0]?.disabled))||Number(security[0]?.auth_version||0)!==context.actor_auth_version)throw new Failure(401,'管理员登录状态已撤销');
   };
-  return {
+  const store = {
     pool, transaction, type, ready:()=>pool.execute('SELECT 1'),
     appendAudit,
     async initializeAdmin(user) {
@@ -62,7 +71,7 @@ export async function createStore(env = process.env) {
       }
       return {created:result.created,user:publicUser(await this.userById(result.id))};
     },
-    async adminUsers(after,limit){const [rows]=await pool.execute(userQuery+' WHERE u.id>? ORDER BY u.id LIMIT ?',[after,limit]);return rows;},
+    async adminUsers(after,limit,search=''){const pattern='%'+search.toLowerCase().replace(/[!%_]/g,match=>'!'+match)+'%';const [rows]=await pool.execute(userQuery+" WHERE u.id>? AND (LOWER(u.email) LIKE ? ESCAPE '!' OR u.id=? OR EXISTS (SELECT 1 FROM bot_info b WHERE b.user_id=u.id AND LOWER(b.username) LIKE ? ESCAPE '!')) ORDER BY u.id LIMIT ?",[after,pattern,search,pattern,limit]);return rows;},
     async adminUpdateUser(id,patch,context){
       try{return await transaction(async connection=>{
         await checkActor(connection,context);
@@ -78,7 +87,9 @@ export async function createStore(env = process.env) {
         if(assignments.length)await connection.execute(`UPDATE user_info SET ${assignments.join(',')} WHERE id=?`,[...args,id]);
         const disabled=patch.disabled??before.disabled;
         if(Object.hasOwn(patch,'disabled'))changes.disabled={before:before.disabled,after:disabled};
+        if(patch.reason)changes.reason=patch.reason;
         await connection.execute('INSERT INTO user_security(user_id,disabled,auth_version) VALUES(?,?,1)'+conflict(type,'user_security',['user_id'],['disabled'],['auth_version=user_security.auth_version+1']),[id,disabled]);
+        if(Object.hasOwn(patch,'disabled'))await store.stopBusiness(id,patch.reason,connection);
         await appendAudit({...context,status:200,changes},connection);
         return publicUser({...before,email:patch.email??before.email,disabled});
       });}catch(error){if(['ER_DUP_ENTRY','23505'].includes(error.code))throw new Failure(409,'该邮箱已被其他用户使用');throw error;}
@@ -91,9 +102,23 @@ export async function createStore(env = process.env) {
       return rows.map(row=>({...row,id:String(row.id),started_at:new Date(Number(row.started_at)).toISOString(),completed_at:new Date(Number(row.completed_at)).toISOString(),changes:json(row.changes)}));
     },
     async revokeSessions(id){await pool.execute('INSERT INTO user_security(user_id,auth_version) VALUES(?,1)'+versionConflict,[id]);},
-    async disableUser(id,disabled){if(!await one('SELECT id FROM user_info WHERE id=?',[id]))throw new Failure(404,'用户不存在');await pool.execute('INSERT INTO user_security(user_id,disabled,auth_version) VALUES(?,?,1)'+conflict(type,'user_security',['user_id'],['disabled'],['auth_version=user_security.auth_version+1']),[id,disabled]);},
+    async disableUser(id,disabled){return transaction(async connection=>{const [users]=await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[id]);if(!users.length)throw new Failure(404,'用户不存在');await connection.execute('INSERT INTO user_security(user_id,disabled,auth_version) VALUES(?,?,1)'+conflict(type,'user_security',['user_id'],['disabled'],['auth_version=user_security.auth_version+1']),[id,disabled]);await store.stopBusiness(id,null,connection);});},
     changePassword:(id,hash)=>transaction(async connection=>{await connection.execute('UPDATE user_info SET password_hash=? WHERE id=?',[hash,id]);await connection.execute('INSERT INTO user_security(user_id,auth_version) VALUES(?,1)'+versionConflict,[id]);}),
-    async accountCount(id){await pool.execute("DELETE FROM tg_info WHERE user_id=? AND status IN ('code_required','password_required') AND expires_at<?",[id,Date.now()]);return Number((await one('SELECT COUNT(*) AS n FROM tg_info WHERE user_id=?',[id])).n);},
+    resetPassword:(id,hash,version)=>transaction(async connection=>{
+      const [users]=await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[id]);
+      const [admins]=await connection.execute('SELECT user_id FROM user_admins WHERE user_id=?',[id]);
+      const [security]=await connection.execute('SELECT disabled,auth_version FROM user_security WHERE user_id=?',[id]);
+      if(!users.length||admins.length||Boolean(Number(security[0]?.disabled))||Number(security[0]?.auth_version||0)!==Number(version))throw new Failure(401,'重置验证已撤销');
+      await connection.execute('UPDATE user_info SET password_hash=? WHERE id=?',[hash,id]);await connection.execute('INSERT INTO user_security(user_id,auth_version) VALUES(?,1)'+versionConflict,[id]);
+    }),
+    async adminSetLimits(id,config,context){return transaction(async connection=>{
+      await checkActor(connection,context);const [users]=await connection.execute('SELECT id FROM user_info WHERE id=? FOR UPDATE',[id]);if(!users.length)throw new Failure(404,'用户不存在');
+      const [admins]=await connection.execute('SELECT user_id FROM user_admins WHERE user_id=?',[id]);if(admins.length)throw new Failure(403,'仅支持普通用户配额');
+      const [old]=await connection.execute('SELECT config FROM user_limits WHERE user_id=?',[id]);
+      await connection.execute('INSERT INTO user_limits(user_id,config,updated_at) VALUES(?,?,?)'+conflict(type,'user_limits',['user_id'],['config','updated_at']),[id,JSON.stringify(config),Date.now()]);
+      await appendAudit({...context,status:200,changes:{limits:{before:old.length?json(old[0].config):{},after:config}}},connection);return {ok:true,overrides:config};
+    });},
+    async accountCount(id){return Number((await one("SELECT COUNT(*) AS n FROM tg_info WHERE user_id=? AND (status NOT IN ('code_required','password_required') OR expires_at>=?)",[id,Date.now()])).n);},
     botCount:async id=>Number((await one('SELECT COUNT(*) AS n FROM bot_info WHERE user_id=?',[id])).n),
     channelCount:async id=>Number((await one('SELECT COUNT(*) AS n FROM channel_info WHERE user_id=?',[id])).n),
     channelFailed:(id,key)=>pool.execute("DELETE FROM channel_info WHERE account_id=? AND request_key=? AND status='creating'",[id,key]),
@@ -103,7 +128,7 @@ export async function createStore(env = process.env) {
     createUser: user => pool.execute('INSERT INTO user_info (id,email,password_hash) VALUES (?,?,?)',[user.id,user.email,user.password_hash]),
     ownsAccount: async(userId,id) => Boolean(await one('SELECT account_id FROM tg_info WHERE user_id=? AND account_id=?',[userId,id])),
     async accountsForUser(userId,after='') {
-      const [rows]=await pool.execute('SELECT account_id,status,created_at FROM tg_info WHERE user_id=? AND account_id>? ORDER BY account_id LIMIT 100',[userId,after]);return rows;
+      const [rows]=await pool.execute('SELECT t.account_id,t.status,t.created_at,i.telegram_user_id,i.profile,a.app_config_id,a.app_version FROM tg_info t LEFT JOIN telegram_identities i ON i.account_id=t.account_id LEFT JOIN account_profiles a ON a.account_id=t.account_id WHERE t.user_id=? AND t.account_id>? ORDER BY t.account_id LIMIT 100',[userId,after]);return rows.map(row=>({...row,profile:row.profile?JSON.parse(crypt.open(row.profile,`identity:${row.telegram_user_id}`)):null}));
     },
     async getAccount(id) {
       const row=await one('SELECT * FROM tg_info WHERE account_id=?',[id]);
@@ -116,7 +141,7 @@ export async function createStore(env = process.env) {
       const existing=await one('SELECT user_id FROM tg_info WHERE account_id=?',[id]);
       if(existing && existing.user_id!==state.user_id)throw new Error('Account ownership mismatch');
       await pool.execute(`INSERT INTO tg_info (account_id,user_id,api_id,api_hash,phone,session,status,expires_at,pending_bot,pending_channel,phone_code_hash)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?) ${conflict(type,'tg_info',['account_id'],['session','status','expires_at','pending_bot','pending_channel','phone_code_hash'],['updated_at=CURRENT_TIMESTAMP'])}`,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?) ${conflict(type,'tg_info',['account_id'],['api_id','api_hash','phone','session','status','expires_at','pending_bot','pending_channel','phone_code_hash'],['updated_at=CURRENT_TIMESTAMP'])}`,
         [id,state.user_id,state.api_id,crypt.seal(state.api_hash,`tg:${id}:api_hash`),crypt.seal(state.phone,`tg:${id}:phone`),crypt.seal(state.session||'',`tg:${id}:session`),state.status,state.expires_at??null,crypt.seal(state.pending_bot?JSON.stringify(state.pending_bot):null,`tg:${id}:pending_bot`),crypt.seal(state.pending_channel?JSON.stringify(state.pending_channel):null,`tg:${id}:pending_channel`),crypt.seal(state.phone_code_hash??null,`tg:${id}:phone_code_hash`)]);
     },
     getLanding: async (id,user) => {const row=await one(`SELECT telegram_bot_id,username AS bot_username,account_id,customer_id,landing_url,card_text,card_image,button_text,webhook_secret,webhook_url
@@ -124,7 +149,7 @@ export async function createStore(env = process.env) {
     configureLanding: async (id,user,config) => {const bot=await one(`SELECT telegram_bot_id FROM bot_info WHERE account_id=? AND ${insensitive('username')}`,[id,user]);return pool.execute(`UPDATE bot_info SET updated_at=CURRENT_TIMESTAMP,customer_id=?,landing_url=?,card_text=?,card_image=?,button_text=?,
       webhook_secret=COALESCE(webhook_secret,?) WHERE account_id=? AND ${insensitive('username')}`,[config.customer_id,config.landing_url,config.card_text,config.card_image,config.button_text,crypt.seal(config.webhook_secret,`bot:${bot.telegram_bot_id}:webhook_secret`),id,user]);},
     webhookRegistered: (id,user,url) => pool.execute(`UPDATE bot_info SET updated_at=CURRENT_TIMESTAMP,webhook_url=? WHERE account_id=? AND ${insensitive('username')}`,[url,id,user]),
-    webhookBot: async botId => decryptBot(await one('SELECT telegram_bot_id,username AS bot_username,token,landing_url,card_text,card_image,button_text,webhook_secret FROM bot_info WHERE telegram_bot_id=? AND customer_id IS NOT NULL',[botId])),
+    webhookBot: async botId => decryptBot(await one('SELECT user_id,account_id,telegram_bot_id,username AS bot_username,token,landing_url,card_text,card_image,button_text,webhook_secret FROM bot_info WHERE telegram_bot_id=? AND customer_id IS NOT NULL',[botId])),
     getChannel: (id,key) => one('SELECT * FROM channel_info WHERE account_id=? AND request_key=?',[id,key]),
     async reserveChannel(id,config) {
       await pool.execute('INSERT INTO channel_info (account_id,user_id,request_key,customer_id,bot_username,title,about) VALUES (?,?,?,?,?,?,?)',
@@ -154,7 +179,8 @@ export async function createStore(env = process.env) {
         [await ownedUser(id),id,bot.token.split(':')[0],bot.username,bot.name,crypt.seal(bot.token,`bot:${bot.token.split(':')[0]}:token`)]);
     },
     async rewrap(table,cursor='',limit=50,context=null) {
-      if(!['tg_info','bot_info'].includes(table)||typeof cursor!=='string'||cursor.length>64||!Number.isInteger(limit)||limit<1||limit>100)throw new Failure(400,'迁移参数无效');
+      if(!['tg_info','bot_info','telegram_apps','telegram_identities','project_versions','telegram_visitors','business_events','api_jobs','webhook_deliveries'].includes(table)||typeof cursor!=='string'||cursor.length>128||!Number.isInteger(limit)||limit<1||limit>100)throw new Failure(400,'迁移参数无效');
+      if(!['tg_info','bot_info'].includes(table))return transaction(async connection=>{if(context)await checkActor(connection,context);const result=await store.rewrapProduct(table,cursor,limit,connection);if(context)await appendAudit({...context,status:200,changes:{table,changed:result.changed}},connection);return result;});
       const key=table==='tg_info'?'account_id':'telegram_bot_id';
       const selected=table==='tg_info'?fields:['token','webhook_secret'];
       const run=async connection=>{
@@ -172,4 +198,5 @@ export async function createStore(env = process.env) {
     },
     close:()=>pool.end(),
   };
+  return installProductStore(store,crypt,env);
 }

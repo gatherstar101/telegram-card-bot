@@ -64,7 +64,7 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 后续登录将 start/verify 路径替换为 `/auth/login/start` 和 `/auth/login/verify`。每次验证成功生成独立的 2 小时令牌；访问不会续期，无刷新令牌接口。Redis 仅保存令牌 SHA-256 摘要对应的用户 ID 和到期时间。退出仅撤销本次平台令牌，不终止 Telegram 会话，不删除 Bot。
 
-邮件同一邮箱最多每 60 秒发送一次，每个验证码有效期窗口最多 5 次；鉴权入口同一来源 IP 最多 20 次，验证入口 60 次；同一邮箱密码检查最多 10 次。获取验证码三个 start 接口还共享每 IP 默认 1 QPS，Telegram 同手机号跨用户/IP 有 60 秒冷却，发送失败也保留；超限返回 429、Retry-After 和 retry_after。Redis 不可用时不会放行受保护接口。
+邮件同一邮箱最多每 60 秒发送一次，每个验证码有效期窗口最多 5 次；鉴权入口同一来源 IP 最多 20 次，验证入口 60 次；同一邮箱密码检查最多 10 次。获取验证码四个 start 接口还共享每 IP 默认 1 QPS，Telegram 同手机号跨用户/IP 有 60 秒冷却，发送失败也保留；超限返回 429、Retry-After 和 retry_after。Redis 不可用时不会放行受保护接口。
 
 ## 四张业务表
 
@@ -77,7 +77,7 @@ curl http://127.0.0.1:3100/v1/accounts \
 
 关系为 `user_info.id → tg_info.user_id`，以及 `tg_info.account_id → bot_info.account_id / channel_info.account_id`；服务检查这些归属关系，数据库目前通过索引关联，没有外键级联删除。不同用户访问他人的 account_id、Bot 或 Channel 返回 404。customer_id 仅是业务标识，不能代替平台身份。旧共享 API_KEY 不再用于业务鉴权。
 
-服务按 DB_TYPE 选择 MySQL 或 PostgreSQL，自动创建环境变量 `DB_DATABASE` 指定的库和以上四张表。初始化 SQL 见 [MySQL SQL](sql/init.sql) 和 [PostgreSQL SQL](sql/postgresql/init.sql)。DB_AUTO_CREATE_DATABASE=false 可连接已有库，仍初始化表/索引。数据库配置只读取 DB_*。最新版本还创建 user_security、channel_posts、api_jobs、webhook_deliveries、user_admins、audit_logs，共十张表。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
+服务按 DB_TYPE 选择 MySQL 或 PostgreSQL，自动创建环境变量 `DB_DATABASE` 指定的库及核心业务表。初始化 SQL 见 [MySQL SQL](sql/init.sql) 和 [PostgreSQL SQL](sql/postgresql/init.sql)。DB_AUTO_CREATE_DATABASE=false 可连接已有库，仍初始化表/索引。数据库配置只读取 DB_*。最新版本包含原十表及十四张产品表，共 24 张表，见[统一流程](PRODUCT-FLOW.md)。凭据与队列载荷使用 CREDENTIAL_KEYS/CREDENTIAL_KEY_ID 加密；旧明文库按 [PRODUCTION.md](PRODUCTION.md) 分页迁移。Telegram session 不受平台 2 小时 TTL 影响，支持 /v1/accounts/:id/logout 或客户端设备列表撤销。
 
 ## 旧 JSON 会话迁移
 
@@ -91,3 +91,7 @@ docker compose exec \
 ```
 
 `DATA_DIR` 默认本地 `./data`，Compose 为 `/data`；只用于读取旧 `<account_id>.json`。脚本将该会话导入 tg_info，保留 account_id，不删除原文件，也不允许转移已属于他人的账号。新 API 登录直接存关系数据库，不再创建 JSON 会话文件。旧 Bot/客户/Channel 表的数据需要由管理员确认归属后迁移，不能仅凭知道旧 account_id 通过 HTTP 认领。
+
+## 普通用户密码恢复
+
+POST /auth/password/reset/start 提交 email，接收邮件 OTP；POST /auth/password/reset/verify 提交 challenge_id/code/new_password，成功后撤销全部会话，重新登录。沿用验证码 TTL、60 秒邮件冷却及发码 QPS。管理员不能用此流程重置。Telegram App 自助配置与测试/生产流程见 [PRODUCT-FLOW.md](PRODUCT-FLOW.md)。

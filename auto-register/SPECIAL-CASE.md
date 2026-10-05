@@ -1,6 +1,6 @@
 # Special case：管理员协助配置 Telegram
 
-此方案保留在 **main 的 Docker 服务**中。管理员初始化、用户资料管理与审计已实现，Telegram 配置管理、资源分配和白名单仍为待实现设计；不适用于 `feature-cfworker`。现有接口和环境变量以主 [README](../README.md) 为准。
+此方案保留在 **main 的 Docker 服务**中。管理员初始化、用户资料管理与审计已实现，用户自助 App 配置与测试 Bot 数字 ID 白名单已实现；管理员协助配置、资源分配和频道审批仍为待实现设计；不适用于 `feature-cfworker`。现有接口和环境变量以主 [README](../README.md) 为准。
 
 ## 设计理念
 
@@ -27,7 +27,7 @@
 
 ## 管理员与默认资源
 
-现有 API 服务已增加管理员账号与权限校验，普通注册不能选择管理员角色。管理员可修改普通用户的邮箱、密码和启停状态，操作持久化审计。后续 Telegram 配置管理、special case 开关与资源分配仍待实现。
+现有 API 服务已增加管理员账号与权限校验，普通注册不能选择管理员角色。管理员可修改普通用户的邮箱、密码和启停状态，操作持久化审计。用户自助 App 配置与双 Bot 项目流程已实现；管理员替用户配置、special case 开关与资源分配仍待实现。
 
 首次管理员账号和密码通过以下**容器运行时环境变量**指定，沿用平台的邮箱账号体系：
 
@@ -53,7 +53,7 @@ ADMIN_PASSWORD=REPLACE_WITH_A_RANDOM_PASSWORD
 
 special case 默认关闭，由管理员启用。默认 Bot 信息初始化指登记并验证平台已有 Bot，不代表启动服务时自动创建 Telegram 账号或 Bot。App 凭据、个人账号登录态和 Bot Token 分别管理，敏感信息沿用当前加密存储。
 
-为保持当前一个 Bot 对应一套 Landing Page 配置的结构，special case 优先采用**一个业务用户分配一个 Bot**。管理员可以统一持有这些 Bot，但不能把同一个 Bot 当作多个用户各自独立的 Bot；同一个 Bot 的 Webhook 和卡片配置会互相影响。多用户共用一个 Bot 并分别配置 Landing Page，需要另行设计路由与授权。
+为保持当前一个 Bot 对应一套 Landing Page 配置的结构，special case 优先采用**每个业务用户每个环境分配独立 Bot**。管理员可以统一持有这些 Bot，但不能把同一个 Bot 当作多个用户各自独立的 Bot；同一个 Bot 的 Webhook 和卡片配置会互相影响。多用户共用一个 Bot 并分别配置 Landing Page，需要另行设计路由与授权。
 
 平台管理的 Bot Token 和 Telegram 个人账号登录态不能直接复制给被分配用户。用户只获得被分配资源的业务操作权限；普通用户不能修改平台资源的 Token、归属或全局 Webhook。
 
@@ -61,7 +61,7 @@ special case 默认关闭，由管理员启用。默认 Bot 信息初始化指�
 
 白名单按 Bot、Channel 分别配置，由管理员或获授权的资源用户维护。开启限制后，空白名单默认拒绝访问。
 
-Bot 的基础规则是匹配 Telegram 更新中发送者的 `username`，统一去掉前导 `@` 并忽略大小写；缺少 username 或未匹配时不发送卡片，也不执行业务操作。不能使用请求者自己提交的 username 作为身份依据。Telegram username 可以变更，长期授权建议保存核实后的 Telegram 用户 ID；使用 username 规则时需在改名后重新核对名单。
+Bot 基础授权使用 Telegram 更新中发送者的数字用户 ID；username 仅用于展示和人工核对。测试 Bot 已实现此规则，special case 白名单管理仍待实现。不能使用请求者自行填写的 username 作为身份依据。
 
 白名单限制的是 Bot 的响应，不能阻止其他人搜索或打开 Bot 对话。名单应明确填写允许访问的 Telegram 用户；仅填写平台账号持有人会使其他访客无法收到 Landing Page 卡片。
 
@@ -72,14 +72,18 @@ Channel 保持私有，使用需要管理员批准的邀请链接，按白名单
 | 项目 | 当前 main | 保留方案 |
 | --- | --- | --- |
 | 邮箱注册后延后登录 Telegram | 已支持 | 保持现有分步流程 |
-| 用户通过请求提供自己的 App 凭据 | 已支持 | 增加后续配置管理 |
+| 用户保存与修改自己的 App 凭据 | 已支持 | 管理员协助仍待实现 |
 | 管理员认证 | env 直接创建、账号密码直接登录、角色校验；可选 `ADMIN_API_KEY` | 保持与资源分配权限分别管理 |
 | 用户资料管理与审计 | 已支持查询、修改邮箱/密码/启停状态、持久化审计 | 后续扩展 Telegram 配置管理 |
-| Telegram 默认配置 | 可选 `TG_*` 运行时默认值 | 与 special case 的启停、资源分配分别管理 |
+| Telegram 默认配置 | API 使用用户 App，TG_API_ID/TG_API_HASH 仅独立脚本 | 与 special case 的启停、资源分配分别管理 |
 | 平台 Bot、Channel 登记及分配 | 未实现 | 验证资源后分配给指定用户 |
-| Bot 白名单 | 未实现 | 私聊入口与实际发送时检查发送者权限 |
+| Bot 白名单 | 测试 Bot 已按数字 ID 检查，special case 未实现 | 使用稳定数字 ID 管理授权 |
 | Channel 白名单 | 未实现 | 私有频道、审批邀请及名单核对 |
 
 现有 `TG_API_ID/TG_API_HASH` 默认值不等于共用 Bot，也不是管理员控制的 special case 开关。当前不要据此开放受白名单保护的平台 Bot。
 
 实现时需同步提供 MySQL/PostgreSQL 数据结构升级、管理员与普通用户权限检查、资源归属校验、加密持久化、API 示例和运行时配置说明，并验证越权、空名单、未匹配用户及重启后的配置行为。完成前，主 README 的 API 清单不列出这些接口。
+
+## 当前统一流程
+
+普通用户统一使用[项目开通流程](PRODUCT-FLOW.md)：注册、登录、保存自有 App、认证 Telegram，系统创建测试/生产独立资源。每个环境资源独占，测试白名单按 Telegram 数字 ID 判断；username 不作为身份主键。上述 special case 平台资源分配和频道审批仍为方案，不是当前可调用接口。

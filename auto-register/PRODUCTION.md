@@ -7,7 +7,7 @@
 在维护窗口停止旧版本写入，备份关系数据库、Redis 和密钥。记录当前镜像与配置，先在测试库恢复和演练升级。
 
 1. 数据库配置统一重命名为 DB_*，不再读取旧前缀；保留对应值、Redis、AUTH_HMAC_SECRET、REDIS_KEY_PREFIX，配置必填 ADMIN_EMAIL、ADMIN_PASSWORD、CREDENTIAL_KEYS、CREDENTIAL_KEY_ID，以及可选独立管理凭据 ADMIN_API_KEY。
-2. 启动新版。服务创建环境变量指定的数据库、十张表，MySQL 还会按 information_schema 扩容旧凭据字段为 TEXT/MEDIUMTEXT。需要 ALTER 权限；此步骤不加密旧数据。
+2. 启动新版。服务创建环境变量指定的数据库、24 张表，MySQL 还会按 information_schema 扩容旧凭据字段为 TEXT/MEDIUMTEXT。需要 ALTER 权限；此步骤不加密旧数据。
 3. 管理员 POST /admin/credentials/rewrap，table=tg_info、cursor=""、limit=50，按 next_cursor 翻页至 done=true；然后处理 bot_info。每批最多 100 行，不返回凭据。
 4. 调用方把创建和核对请求改为 202 后查询 /v1/accounts/:id/jobs/:job_id。成功后读取 result，失败查看 error。
 5. 检查 ready 与真实业务闭环后恢复流量。SMTP 未配时 ready=503，但 health=200，可进行基础验证。
@@ -18,13 +18,13 @@ curl -X POST https://YOUR_API_HOST/admin/credentials/rewrap \
   -d '{"table":"tg_info","cursor":"","limit":50}'
 ```
 
-新库自动写密文，无需明文迁移。普通接口默认拒绝明文，不提供全局允许明文开关。启动迁移仅扩容已知旧列和幂等建表，不能代替未来业务 SQL 迁移。手动 SQL 见 MySQL init.sql、002-security.sql 与 PostgreSQL sql/postgresql/init.sql，执行前选择正确库，避免直接对生产反复 ALTER。
+新库自动写密文，无需明文迁移。普通接口默认拒绝明文，不提供全局允许明文开关。启动迁移仅扩容已知旧列和幂等建表，不能代替未来业务 SQL 迁移。手动 SQL 见 MySQL init.sql、002-security.sql、003-product.sql 与 PostgreSQL sql/postgresql/ 下对应 SQL，执行前选择正确库，避免直接对生产反复 ALTER。
 
 ## 运行时配置
 
 全部变量通过容器 env 注入，完整默认值与范围见[主 README](../README.md#configuration)和 [.env.example](.env.example)。构建不连接生产依赖，不包含真实 .env。
 
-同邮箱注册/登录发码共享 60 秒冷却，同 Telegram 手机号跨用户/IP 共享 60 秒冷却，失败也保留。三个 start 接口共享默认每 IP 1 QPS；429 提供 Retry-After 和 retry_after。验证码默认 600 秒、平台会话 7200 秒，访问不续期。修改 OTP_IP_QPS 不改变冷却时间。
+同邮箱注册/登录/密码恢复发码共享 60 秒冷却，同 Telegram 手机号跨用户/IP 共享 60 秒冷却，失败也保留。四个 start 接口共享默认每 IP 1 QPS；429 提供 Retry-After 和 retry_after。验证码默认 600 秒、平台会话 7200 秒，访问不续期。修改 OTP_IP_QPS 不改变冷却时间。
 
 多个 API 副本共享关系数据库、Redis、密钥和 REDIS_KEY_PREFIX。当前 Compose 使用固定宿主机端口，扩容需要部署平台或独立端口与负载均衡。初始化/迁移阶段须串行发布，避免多副本同时 ALTER。运行账号需要目标库的表/索引 DDL 与业务读写权限；MySQL 旧列升级需要 ALTER，PostgreSQL 自动建库需要 CREATEDB 和维护库连接权限。已有库可用 DB_AUTO_CREATE_DATABASE=false 跳过建库；DB_SSL_MODE=verify-full 验证证书与主机名。数据库密码通过 DB_PASSWORD 运行时注入。切换 DB_TYPE 不会迁移两个引擎之间的数据，须另行迁移并保留原密钥。
 
@@ -34,7 +34,7 @@ TRUST_PROXY_HOPS 默认 0，只按 TCP 对端限流。可信反向代理后按�
 
 AES-256-GCM 密文绑定记录和字段。CREDENTIAL_KEYS 是 JSON 密钥环，值为 32 字节随机密钥的 base64，CREDENTIAL_KEY_ID 选择写入版本。密码使用 scrypt。手机号、api_hash、StringSession、phone_code_hash、pending 信息、Bot Token 和 Webhook Secret 均加密；任务与投递载荷也加密。
 
-轮换先加入新版本并保留旧版本，切换写入版本，分页 rewrap tg_info/bot_info。**不能仅迁移两张表就删除旧密钥**：api_jobs 的 body/result、webhook_deliveries.payload 与备份还可能使用旧版本；当前 rewrap 不迁移队列表。保留仍被记录与恢复备份使用的旧密钥。ADMIN_API_KEY 与用户 Token 分开管理。
+轮换先加入新版本并保留旧版本，切换写入版本，分页 rewrap tg_info、bot_info、telegram_apps、telegram_identities、project_versions、telegram_visitors、business_events、api_jobs、webhook_deliveries。复合主键使用返回的 next_cursor。所有在线数据和需要恢复的备份处理前保留旧密钥。ADMIN_API_KEY 与用户 Token 分开管理。
 
 关系数据库定期备份并演练恢复，密钥另行安全备份；恢复关系数据库不会撤回 Telegram 远端动作。Redis 配置符合可接受的数据丢失窗口的持久化与故障切换，丢失验证码/平台会话后用户重新邮箱登录。Redis 锁在异步复制故障切换中可能丢失，不能保证严格分布式 exactly-once；保留关系数据库检查点和未知结果核对。
 
@@ -57,13 +57,13 @@ curl -X POST https://YOUR_API_HOST/v1/accounts/ACCOUNT_ID/jobs/JOB_ID/retry \
 
 未知 Bot/Channel 先 reconcile 再 retry 原任务。Bot 通过 BotFather 请求已有 Token 并 getMe 核对；Channel 要求已有本地记录、远端 channel_id/access_hash，核对创建者、标题及频道类型。不会根据未知结果盲目再次创建。帖子复用 random_id，不能宣称无限期去重。清理仅处理默认保留 7 天的完成/失败/取消任务，uncertain 保留至核对。
 
-后台每个副本一次领取一个创建任务和一个投递，默认分别每 1000 ms 轮询；操作完成后再启动下一轮。没有额外 broker 或常驻 Telegram 接收客户端。Redis 锁使用随机持有者值和比较释放，避免释放他人的锁。[Redis SET 说明](https://redis.io/docs/latest/commands/set/)。
+后台每个副本分别运行创建任务、Webhook 投递和项目编排三个循环，每轮各领取一项；创建任务与投递默认每 1000 ms 轮询，项目阶段推进后至少间隔 1000 ms 再领取。操作完成后再启动下一轮。没有额外 broker 或常驻 Telegram 接收客户端。Redis 锁使用随机持有者值和比较释放，避免释放他人的锁。[Redis SET 说明](https://redis.io/docs/latest/commands/set/)。
 
 ## Webhook 投递
 
-入口验证专属 Secret 与 update_id，只处理私聊 /start，持久化后返回 200。相同 bot_id/update_id 默认 7 天内去重；队列满或正在处理接收返回 503，Telegram 可以重投。达到 Bot/私聊发送分钟上限时确认接收但不再发送。
+入口验证专属 Secret 与 update_id，私聊 /start 持久化投递后返回 200；其他合规更新记录事件和可用访客资料，不触发发卡。相同 bot_id/update_id 默认 7 天内去重；队列满或正在处理接收返回 503，Telegram 可以重投。达到 Bot/私聊发送分钟上限时确认接收但不再发送。
 
-投递为 queued/sending/sent/failed/uncertain。明确 Telegram 429 遵守 retry_after，最多 5 次；明确 4xx failed。网络错误、5xx 或发送中断 uncertain，不自动重发，因为 sendMessage 没有远端幂等键。
+投递为 queued/sending/sent/failed/uncertain/cancelled。明确 Telegram 429 遵守 retry_after，最多 5 次；明确 4xx failed。网络错误、5xx 或发送中断 uncertain，不自动重发，因为 sendMessage 没有远端幂等键。
 
 ```bash
 curl https://YOUR_API_HOST/v1/accounts/ACCOUNT_ID/bots/BOT_USERNAME/deliveries/UPDATE_ID \
@@ -73,7 +73,7 @@ curl -X POST https://YOUR_API_HOST/v1/accounts/ACCOUNT_ID/bots/BOT_USERNAME/deli
   -d '{"allow_duplicate":true}'
 ```
 
-未知结果重试需明确 allow_duplicate=true，可能重复发送；failed 重试不需要该标记。队列恢复不会盲目重发已领取后中断的消息。更新 landing 后投递读取最新配置。
+未知结果重试需明确 allow_duplicate=true，可能重复发送；failed 重试不需要该标记。队列恢复不会盲目重发已领取后中断的消息。项目投递使用接收时的配置版本；旧版独立 Bot 投递仍读取最新 landing 配置。
 
 ## 监控、容量与退出
 
@@ -91,6 +91,10 @@ SIGTERM 停止新请求和轮询，等待活动任务完成再关闭依赖；Com
 
 ADMIN_EMAIL/ADMIN_PASSWORD 均为必填运行时配置；启动直接创建管理员，创建和 /admin/login 均不需要邮件验证码及 SMTP。已有管理员重启不覆盖密码，普通邮箱冲突不会自动提升角色。普通用户鉴权仍依赖邮件验证码，SMTP 缺失时 /ready 返回 503。
 
-用户管理接口仅修改普通用户邮箱、密码和启停状态，并撤销旧会话；管理员自身改密使用 /auth/password。资料修改、凭据重加密和成功审计同一事务，审计写入失败时回滚。所有管理请求的成功、拒绝和失败均保存 UTC 时间、request_id、操作者、目标用户、IP、连接来源 IP、UA 与脱敏变更；不保存密码、哈希或 Token。查询/拒绝审计无法写入时返回 503。
+用户管理接口支持修改普通用户邮箱、密码、启停状态，以及单独设置资源配额，并撤销旧会话；管理员自身改密使用 /auth/password。资料修改、凭据重加密和成功审计同一事务，审计写入失败时回滚。所有管理请求的成功、拒绝和失败均保存 UTC 时间、request_id、操作者、目标用户、IP、连接来源 IP、UA 与脱敏变更；不保存密码、哈希或 Token。查询/拒绝审计无法写入时返回 503。
 
 TRUST_PROXY_HOPS 仅在可信代理入口设置，限制直连并由代理重写转发头。audit_logs 查询按 ID 分页，只提供读取接口；容量与保留周期由数据库运维管理。初始化日志操作者为 bootstrap，无 HTTP IP/UA；独立密钥调用标记为 api_key。接口及完整示例见[主 README](../README.md#api-reference)。
+
+## 产品流程与全量停用
+
+项目编排、测试/生产发布、配置版本、原始数据保留和操作步骤见 [PRODUCT-FLOW.md](PRODUCT-FLOW.md)。启动自动增加产品表与索引，不自动接管旧 Bot。禁用在 SQL 事务中更新业务授权版本、取消积压、挂起流程并审计；所有远端派发再次检查。已经批准的在途请求可能完成，管理员详情展示在途状态。恢复不会自动重放或继续流程；旧追踪链接不自动恢复。远端帖子、成员和第三方地址不自动删除。

@@ -32,13 +32,13 @@ export class Jobs {
     },30);
     if(result.busy)throw new Failure(409,'任务提交正在处理，请稍后重试');return result.value;
   }
-  async checkpoint(effect){const row=jobContext.getStore();if(row){if(!await this.queue.update(row,{effect,updated_at:Date.now()},true))throw new Failure(409,'任务租约已失效');row.effect=effect;}}
+  async checkpoint(effect){const row=jobContext.getStore();if(row){if(this.store.assertTask)await this.store.assertTask(row.id,row.user_id);if(!await this.queue.update(row,{effect,updated_at:Date.now()},true))throw new Failure(409,'任务租约已失效');row.effect=effect;}}
   async known(row){
     const body=JSON.parse(this.crypt.open(row.body,`job:${row.id}:body`));const state=await this.store.getAccount(row.account_id);
     if(state?.pending_bot&&!await this.store.get(row.account_id,state.pending_bot.username))await this.store.save(row.account_id,state.pending_bot);
     if(state?.pending_channel)await this.store.saveChannel(row.account_id,state.pending_channel.request_key,state.pending_channel);
     if(/\/bots$/.test(row.path))return this.store.get(row.account_id,body.username);
-    if(/\/channels$/.test(row.path)){const c=await this.store.getChannel(row.account_id,body.request_key);if(c?.status==='ready'){const {access_hash,posts,...result}=c;return {...result,bot_url:`https://t.me/${c.bot_username}?start=channel`};}}
+    if(/\/channels$/.test(row.path)){const c=await this.store.getChannel(row.account_id,body.request_key);if(c?.status==='ready'){const {access_hash,posts,...result}=c;const source=/^[a-f0-9-]{36}-(test|production)$/.test(c.request_key||'')?c.request_key:'channel';return {...result,bot_url:`https://t.me/${c.bot_username}?start=${source}`};}}
     if(/\/posts$/.test(row.path)){const p=await this.store.getPost(row.account_id,row.path.split('/').at(-2),body.request_key);if(p?.status==='sent')return p;}
     return null;
   }
@@ -61,6 +61,7 @@ export class Jobs {
     const heartbeat=setInterval(()=>this.queue.heartbeat(row,seconds).catch(()=>audit('job_lease_error')),30000);heartbeat.unref();
     try{
       const user=await this.store.userById(row.user_id);if(!user||user.disabled||Number(user.auth_version||0)!==Number(row.auth_version)||!await this.store.ownsAccount(row.user_id,row.account_id)){await this.finish(row,'cancelled',null,{status:401,code:'AUTH_REVOKED'});return;}
+      if(this.store.assertTask)try{await this.store.assertTask(row.id,row.user_id);}catch(error){await this.finish(row,'cancelled',null,{status:error.status,code:error.code});return;}
       const lock=await withLease(this.auth.cache,`${this.env.REDIS_KEY_PREFIX||'telegram-bot:'}job-phone:${row.phone_key}`,async()=>{
         if(row.previous_status==='running'){const known=await this.known(row);if(known){await this.finish(row,'succeeded',known);return;}if(row.effect){await this.finish(row,'uncertain',null,{status:409,code:'REMOTE_RESULT_UNKNOWN'});return;}}
         const body=JSON.parse(this.crypt.open(row.body,`job:${row.id}:body`));
@@ -71,10 +72,11 @@ export class Jobs {
           if(kind){const quota=await withLease(this.auth.cache,`${this.env.REDIS_KEY_PREFIX||'telegram-bot:'}create-user:${user.id}`,async()=>{
             const existing=kind==='bot'?await this.store.get(row.account_id,body.username):await this.store.getChannel(row.account_id,body.request_key);
             const count=kind==='bot'?await this.store.botCount(user.id):await this.store.channelCount(user.id);
-            if(!existing&&count>=integer(this.env,kind==='bot'?'MAX_BOTS_PER_USER':'MAX_CHANNELS_PER_USER',kind==='bot'?20:50,1,1000))throw new Failure(429,'资源数量达到配额');return action();
+            const name=kind==='bot'?'MAX_BOTS_PER_USER':'MAX_CHANNELS_PER_USER';const maximum=this.store.userLimit?await this.store.userLimit(user.id,name):integer(this.env,name,kind==='bot'?20:50,1,1000);
+            if(!existing&&count>=maximum)throw new Failure(429,'资源数量达到配额','RESOURCE_QUOTA','review');return action();
           });if(quota.busy)throw new Failure(409,'用户已有创建操作');result=quota.value;}else result=await action();
           await this.finish(row,'succeeded',result);
-        }catch(error){const known=await this.known(row);if(known){await this.finish(row,'succeeded',known);return;}if(error.remote_rejected){row.effect=null;await this.queue.update(row,{effect:null},true);}const uncertain=Boolean(row.effect)&&!error.errorMessage;await this.finish(row,uncertain?'uncertain':'failed',null,{status:error.status||502,code:uncertain?'REMOTE_RESULT_UNKNOWN':'OPERATION_FAILED'});}
+        }catch(error){const known=await this.known(row);if(known){await this.finish(row,'succeeded',known);return;}if(error.remote_rejected){row.effect=null;await this.queue.update(row,{effect:null},true);}const uncertain=Boolean(row.effect)&&!error.errorMessage;const stopped=['USER_DISABLED','BUSINESS_REVOKED','PROJECT_INACTIVE'].includes(error.code);await this.finish(row,uncertain?'uncertain':stopped?'cancelled':'failed',null,{status:error.status||502,code:uncertain?'REMOTE_RESULT_UNKNOWN':error.code||'OPERATION_FAILED'});}
       });
       if(lock.busy)await this.queue.update(row,{status:row.previous_status==='running'?'running':'queued',lease:null,lease_until:Date.now()+1000,next_at:Date.now()+1000},true);
     }finally{clearInterval(heartbeat);}

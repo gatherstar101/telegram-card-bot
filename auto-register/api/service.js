@@ -4,8 +4,14 @@ import { Api } from 'teleproto';
 import { computeCheck } from 'teleproto/Password.js';
 import { Failure } from './errors.js';
 import { createConversion,botApi } from './conversion.js';
+import { jobContext } from './jobs.js';
+import { workflowContext } from './execution-context.js';
 
-export function createService({ store, auth, connected, env = process.env, checkpoint = async () => {}, fetcher = fetch }) {
+export function createService({ store, auth, connected: connect, env = process.env, checkpoint = async () => {}, fetcher = fetch }) {
+async function connected(state,operation) {
+  const workflow=workflowContext.getStore();const epoch=store.assertBusiness?await store.assertBusiness(state.user_id,workflow?.business_epoch):undefined;
+  return connect(state,client=>operation(new Proxy(client,{get(target,key){const value=Reflect.get(target,key,target);if(typeof value!=='function')return value;return async(...args)=>{const job=jobContext.getStore();const task=job&&store.assertTask?await store.assertTask(job.id,state.user_id):null;if(store.assertBusiness)await store.assertBusiness(state.user_id,task?.business_epoch??epoch);return store.dispatch?store.dispatch(state.user_id,task?.business_epoch??epoch,'telegram_operation',()=>value.apply(target,args),task?.project_id||workflow?.project_id,task?.project_epoch??workflow?.project_epoch):value.apply(target,args);};}})));
+}
 const busy = new Set();
 function requireValue(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new Failure(400, `缺少 ${name}`);
@@ -31,11 +37,19 @@ async function exchange(client, peer, text) {
 }
 const conversion = createConversion({ store, connected, save, env, checkpoint, fetcher });
 async function route(method, path, body, user) {
+  const epoch=store.assertBusiness?await store.assertBusiness(user.id,workflowContext.getStore()?.business_epoch):undefined;
+  const remoteBot=async(token,method,payload)=>{
+    const task=jobContext.getStore()&&store.assertTask?await store.assertTask(jobContext.getStore().id,user.id):null;
+    const workflow=workflowContext.getStore();const action=()=>botApi(token,method,payload,fetcher);
+    return store.dispatch?store.dispatch(user.id,task?.business_epoch??epoch,'bot_api',action,task?.project_id||workflow?.project_id,task?.project_epoch??workflow?.project_epoch):action();
+  };
+  if(jobContext.getStore()&&store.assertTask)await store.assertTask(jobContext.getStore().id,user.id);
   if (method === 'GET' && path === '/v1/accounts') return { accounts: await store.accountsForUser(user.id) };
   if (method === 'POST' && path === '/v1/login/start') {
     const phone = requireValue(body.phone ?? env.TG_PHONE, 'phone');
-    const api_id = Number(body.api_id ?? env.TG_API_ID);
-    const api_hash = requireValue(body.api_hash ?? env.TG_API_HASH, 'api_hash');
+    const app=body.app_config_id&&store.telegramApp?await store.telegramApp(user.id,body.app_config_id):null;
+    const api_id = Number(app?.api_id ?? body.api_id);
+    const api_hash = requireValue(app?.api_hash ?? body.api_hash, 'api_hash');
     if (!Number.isSafeInteger(api_id) || api_id <= 0 || !/^[a-f0-9]{32}$/i.test(api_hash) || !/^\+\d{7,15}$/.test(phone)) throw new Failure(400, 'App 凭据或手机号格式错误');
     // Serialize by phone even when callers start separate login attempts.
     if (busy.has(phone)) throw new Failure(409, '该手机号正在操作');
@@ -43,7 +57,9 @@ async function route(method, path, body, user) {
     let release;
     try {
       release = await auth.lockPhone(phone);
-      const id = randomUUID();
+      const id = store.claimPhone?await store.claimPhone(user.id,phone,randomUUID()):randomUUID();
+      const previous=await store.getAccount(id);
+      if(previous?.status==='authorized'&&body.reauthenticate!==true)return {account_id:id,status:'authorized',delivery:null};
       const state = { user_id: user.id, api_id, api_hash, phone, status: 'code_required' };
       const delivery = await connected(state, async client => {
         const result = await client.sendCode({ apiId: api_id, apiHash: api_hash }, phone);
@@ -53,6 +69,7 @@ async function route(method, path, body, user) {
       });
       state.expires_at = Date.now() + 10 * 60 * 1000;
       await save(id, state);
+      if(app)await store.pool.execute('INSERT INTO account_profiles(account_id,app_config_id,app_version,updated_at) VALUES(?,?,?,?)'+(store.type==='postgresql'?' ON CONFLICT(account_id) DO UPDATE SET app_config_id=EXCLUDED.app_config_id,app_version=EXCLUDED.app_version,updated_at=EXCLUDED.updated_at':' ON DUPLICATE KEY UPDATE app_config_id=VALUES(app_config_id),app_version=VALUES(app_version),updated_at=VALUES(updated_at)'),[id,app.id,app.version,Date.now()]);
       return { account_id: id, status: state.status, delivery };
     } finally { busy.delete(phone); await release?.(); }
   }
@@ -82,7 +99,7 @@ async function route(method, path, body, user) {
       delete state.pending_channel;
       await save(id, state);
     }
-    const converted = await conversion.route(method, suffix, id, state, body);
+    const converted = await conversion.route(method, suffix, id, state, body, epoch);
     if (converted !== undefined) return converted;
     if (method === 'GET' && !action) return { account_id: id, status: state.status };
     if (method === 'POST' && suffix === 'logout' && store.updateToken) {
@@ -117,20 +134,22 @@ async function route(method, path, body, user) {
           state.status = 'authorized';
         }
         if (state.status === 'authorized') {
-          if ((await client.getMe()).bot) throw new Failure(422, '必须使用个人账号');
+          const me=await client.getMe();
+          if (me.bot) throw new Failure(422, '必须使用个人账号');
+          if(store.recordIdentity)try{await store.recordIdentity(user.id,id,me,state.phone);}catch(error){state.status='identity_conflict';state.session='';throw error;}
           delete state.phone_code_hash;
           delete state.expires_at;
         }
       });
       await save(id, state);
-      return { account_id: id, status: state.status };
+      return { account_id: id, status: state.status,...(state.status==='password_required'?{next_action:'provide_password'}:{}) };
     }
     if (action==='bots' && method==='PUT' && suffix===`bots/${username}/token` && store.updateToken) {
       const bot=await store.get(id,username);
       if(!bot)throw new Failure(404,'Bot 不存在');
       const token=requireValue(body.token,'token');
       if(!/^\d+:[A-Za-z0-9_-]{30,}$/.test(token)||token.split(':')[0]!==bot.token.split(':')[0])throw new Failure(400,'Token 必须属于同一个 Bot');
-      const me=await botApi(token,'getMe',{},fetcher);
+      const me=await remoteBot(token,'getMe',{});
       if(!me.is_bot||me.username?.toLowerCase()!==username.toLowerCase()||String(me.id)!==token.split(':')[0])throw new Failure(400,'Token 与 Bot 不匹配');
       await store.updateToken(id,username,token);
       return {ok:true,username};
@@ -149,7 +168,7 @@ async function route(method, path, body, user) {
         const reply=await exchange(client,peer,`@${username}`);
         const token=reply.match(/\b\d+:[A-Za-z0-9_-]{30,}\b/)?.[0];
         if(!token)throw new Failure(409,'BotFather 未确认该 Bot 的归属或 Token，请人工核对');
-        const me=await botApi(token,'getMe',{},fetcher);
+        const me=await remoteBot(token,'getMe',{});
         if(!me.is_bot||me.username?.toLowerCase()!==username.toLowerCase())throw new Failure(409,'BotFather 返回的 Bot 不匹配');
         bot={username:me.username,name:me.first_name,token,url:`https://t.me/${me.username}`};
         state.pending_bot=bot;await save(id,state);await store.save(id,bot);delete state.pending_bot;await save(id,state);
@@ -184,7 +203,7 @@ async function route(method, path, body, user) {
           throw error;
         }
         if(store.updateToken) {
-          const me=await botApi(token,'getMe',{},fetcher);
+          const me=await remoteBot(token,'getMe',{});
           if(!me.is_bot||me.username?.toLowerCase()!==user.toLowerCase()||String(me.id)!==token.split(':')[0])throw new Failure(409,'BotFather 返回的 Bot 与请求不一致，需要核对');
         }
         bot = { username: user, name, token, url: `https://t.me/${user}` };

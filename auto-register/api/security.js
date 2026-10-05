@@ -64,7 +64,7 @@ export async function adminIPGuard(cache,env,ip,{failed=false}={}) {
     remaining=Number(await (failed?cache.adminAuthFailure(key,maximum,seconds):cache.adminIPBanTTL(key,maximum)));
   }catch{throw new Failure(503,'管理员防爆破校验不可用，请稍后重试');}
   if(remaining>0){
-    const error=new Failure(429,'此 IP 已被暂时禁止访问管理员接口');
+    const error=new Failure(429,'此 IP 已被暂时禁止访问管理员接口','ADMIN_IP_BANNED','wait');
     error.retry_after=remaining;
     error.admin_ip_banned=true;
     throw error;
@@ -73,7 +73,7 @@ export async function adminIPGuard(cache,env,ip,{failed=false}={}) {
 export async function rate(cache,env,kind,value,max,seconds=60) {
   const key=`${env.REDIS_KEY_PREFIX||'telegram-bot:'}limit:${kind}:${digest(String(value))}`;
   if(await cache.increment(key,seconds)>max) {
-    const error=new Failure(429,'请求过于频繁，请稍后重试');
+    const error=new Failure(429,'请求过于频繁，请稍后重试',kind==='telegram-login-phone'?'OTP_COOLDOWN':'RATE_LIMITED','wait');
     error.retry_after=cache.ttl?Math.max(1,await cache.ttl(key)):seconds;
     throw error;
   }
@@ -95,5 +95,7 @@ export function validateConfig(env) {
     ['TELEGRAM_TIMEOUT_SECONDS',60,15,240],['JOB_TIMEOUT_SECONDS',240,30,240],['JOB_QUEUE_LIMIT',20,1,100],['JOB_RETENTION_SECONDS',604800,86400,2592000],
     ['WEBHOOK_CHAT_PER_MINUTE',5,1,60],['WEBHOOK_BOT_PER_MINUTE',300,1,3000],['WEBHOOK_QUEUE_LIMIT',500,1,10000],['WEBHOOK_RETENTION_SECONDS',604800,172800,2592000],
     ['QUEUE_POLL_INTERVAL_MS',1000,100,10000],['TRUST_PROXY_HOPS',0,0,10],['DB_POOL_SIZE',10,1,100],['DB_CONNECT_TIMEOUT_MS',5000,1000,30000]
+    ,['MAX_TG_APPS_PER_USER',5,1,100],['MAX_PROJECTS_PER_USER',10,1,1000],['MAX_ACTIVE_WORKFLOWS_PER_USER',2,1,20],
+    ['BUSINESS_EVENT_RETENTION_DAYS',90,1,3650],['RAW_UPDATE_RETENTION_DAYS',7,0,90],['TRACKING_LINK_TTL_SECONDS',86400,60,604800]
   ])integer(env,name,fallback,min,max);
 }

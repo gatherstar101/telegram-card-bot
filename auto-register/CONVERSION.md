@@ -2,7 +2,7 @@
 
 # 客户 Bot、Landing Page 和 Channel 转化流程
 
-在同一个已登录 Telegram 账号下，可以为不同客户创建各自的 Bot、绑定不同落地页，并创建频道和发布引导内容。`customer_id` 是客户业务标识；访问由平台注册用户和 Telegram account_id 的归属控制。这里配置的是客户已有的 Landing Page URL，不自动生成或部署落地页。
+在同一个已登录 Telegram 账号下，可以为不同客户创建各自的 Bot、绑定不同落地页，并创建频道和发布引导内容。`customer_id` 是客户业务标识；访问由平台注册用户和 Telegram account_id 的归属控制。这里配置的是客户已有的 Landing Page URL，不自动生成或部署落地页。本文介绍独立资源的底层 API；新业务优先使用[项目开通、测试验收与发布](PRODUCT-FLOW.md)。项目管理的 Bot landing/webhook 写操作不能绕过版本流程。
 
 流程拆分为独立 API，便于分别调用和恢复：
 
@@ -15,7 +15,7 @@ Channel → Bot 链接 → 用户按 Start → 客户卡片 → Landing Page
         └─ Landing Page 直接链接
 ```
 
-频道帖子同时包含落地页直接链接。加入频道不会自动启动 Bot，也不会主动私信频道成员。当前统计范围不包含点击、注册或成交归因。
+频道帖子同时包含落地页直接链接。加入频道不会自动启动 Bot，也不会主动私信频道成员。项目模式支持来源、启动、投递、签名跳转与客户成交回传统计；独立资源的直接 Landing URL 不提供项目跳转归因。
 
 ## 部署和配置
 
@@ -31,7 +31,7 @@ PUBLIC_BASE_URL=https://bots.example.com
 docker compose up -d --build
 ```
 
-启动会自动创建 `user_info`、`tg_info`、`bot_info`、`channel_info`；客户卡片保存在 bot_info，新帖子保存在 channel_posts，旧 posts JSON 兼容读取；任务与投递记录保存在 api_jobs/webhook_deliveries。旧表保留，需确认归属后迁移。可选手工 SQL 同样包含这些表。PUBLIC_BASE_URL 只用于注册 Webhook；已经注册的 URL 需重新调用注册接口才能改变。
+启动自动初始化 24 张表，包括 `user_info`、`tg_info`、`bot_info`、`channel_info` 和项目流程表；客户卡片保存在 bot_info，新帖子保存在 channel_posts，旧 posts JSON 兼容读取；任务与投递记录保存在 api_jobs/webhook_deliveries。旧表保留，需确认归属后迁移。可选手工 SQL 同样包含这些表。PUBLIC_BASE_URL 用于注册 Webhook 和项目签名追踪跳转；已经注册的 URL 需重新调用注册接口才能改变。
 
 以下示例的 YOUR_ACCESS_TOKEN、ACCOUNT_ID、Bot 用户名和 URL 使用自己的实际值。第一次先按 [AUTH.md](AUTH.md) 完成平台邮箱注册/登录，取得 access_token，再按项目 README 完成 Telegram 登录，之后复用返回的 ACCOUNT_ID。
 
@@ -39,7 +39,7 @@ docker compose up -d --build
 
 按 [项目 README 登录步骤](../README.md#usage) 调用 `/v1/login/start` 取得 account_id，再向 `/v1/accounts/:account_id/verify` 提交收到的验证码，必要时提交两步验证密码。返回 authorized 后服务保存会话，调用方保存同一个 account_id，后续步骤持续复用。
 
-已有会话时不需要每次调用 login/start；该接口再次调用会生成新的 ID。账号状态查询只读取本地记录，不实时检查 Telegram 会话。首次配置卡片时需要已由本服务保存的 Bot；PUBLIC_BASE_URL 仅在注册 Webhook 时需要，Channel 创建只依赖有效用户会话和 Landing 配置。
+已有会话时不需要每次调用 login/start；再次 start 已授权账号优先复用 account_id；需要重新发码时传 reauthenticate=true。账号状态查询只读取本地记录，不实时检查 Telegram 会话。首次配置卡片时需要已由本服务保存的 Bot；PUBLIC_BASE_URL 仅在注册 Webhook 时需要，Channel 创建只依赖有效用户会话和 Landing 配置。
 
 ## 1. 创建 Bot
 
@@ -88,7 +88,7 @@ curl -X POST http://127.0.0.1:3100/v1/accounts/ACCOUNT_ID/bots/customer_a_unique
 {"username":"customer_a_unique_bot","webhook_url":"https://bots.example.com/webhooks/123456","status":"registered"}
 ```
 
-用户私聊发送 `/start` 时，API 根据 Bot ID 从关系数据库读取客户配置并发送图片或文字、网址按钮。这里由 Docker API 直接处理卡片，无需为每个客户部署 Cloudflare Worker。一个 Bot 只能设置一个 Webhook；注册到 Docker API 会替换该 Bot 之前的 Worker Webhook。独立 `card-bot` 仍可用于其他 Bot。
+用户私聊发送 `/start` 时，API 根据 Bot ID 从关系数据库读取客户配置并发送图片或文字、网址按钮。这里由 Docker API 直接处理卡片，无需为每个客户部署 Cloudflare Worker。一个 Bot 只能设置一个 Webhook；注册到 Docker API 会替换该 Bot 之前的 Worker Webhook。独立 `card-bot` **已弃用 / 不可用**，只保留历史源码，不再作为部署方案。
 
 ## 4. 创建客户 Channel
 

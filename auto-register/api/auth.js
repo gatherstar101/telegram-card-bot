@@ -75,13 +75,13 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
     await limit('email', email, 5);
     const cooldown = `${prefix}mail-cooldown:${digest(email)}`;
     if (!await state.set(cooldown, '1', { NX: true, EX: 60 })) {
-      const error=new Failure(429,'请等待 60 秒后再发送邮件验证码');
+      const error=new Failure(429,'请等待 60 秒后再发送邮件验证码','OTP_COOLDOWN','wait');
       error.retry_after=state.ttl?Math.max(1,await state.ttl(cooldown)):60;
       throw error;
     }
     const id = randomUUID(); const code = String(randomInt(100000, 1000000));
     await state.set(challengeKey(id), JSON.stringify({ purpose, email, ...values, code_hash: otpHash(id, code), attempts: 0 }), { EX: challengeTTL });
-    try { await sendCode(email, code, purpose); }
+    try { if(!values.silent)await sendCode(email, code, purpose); }
     catch {
       await state.del(challengeKey(id));
       throw new Failure(503, '验证码邮件发送失败，请检查邮件服务后重试');
@@ -108,6 +108,7 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
     const data = JSON.parse(raw);
     if (data.expires_at <= now()) throw new Failure(401, '登录状态已过期，请重新登录');
     const user = await store.userById(data.user_id);
+    if(user?.disabled)throw new Failure(401,'用户已禁用，全部业务停止','USER_DISABLED','contact_administrator');
     if (!user || user.disabled || (data.auth_version || 0) !== (user.auth_version || 0)) throw new Failure(401, '登录状态已撤销');
     return { user: { ...safeUser(user),auth_version:user.auth_version || 0 }, token };
   }
@@ -134,6 +135,17 @@ export function createAuth({ redis, cache, store, sendCode, secret, prefix = 'te
       return async () => state.release(lockKey, lease);
     },
     async route(method, path, body, header, ip) {
+      if(method==='POST'&&path==='/auth/password/reset/start'){
+        await limit('auth-ip',ip,20);const email=emailAddress(body.email);const user=await store.userByEmail(email);const eligible=user&&!user.disabled&&user.role!=='admin';
+        return issue('reset',email,{user_id:eligible?user.id:null,auth_version:eligible?user.auth_version||0:0,silent:!eligible});
+      }
+      if(method==='POST'&&path==='/auth/password/reset/verify'){
+        passwordValue(body.new_password);const challenge=await consume(body,'reset',ip);
+        if(!challenge.user_id)throw new Failure(401,'重置验证无效');
+        await store.resetPassword(challenge.user_id,await hashPassword(body.new_password),challenge.auth_version);
+        if(store.event)await store.event({user_id:challenge.user_id,type:'password_reset',data:{ip}});
+        return {ok:true,status:'login_required'};
+      }
       if (method === 'POST' && path === '/auth/register/start') {
         await limit('auth-ip', ip, 20);
         const email = emailAddress(body.email);

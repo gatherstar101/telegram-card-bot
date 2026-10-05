@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { emailAddress, hashPassword, passwordValue } from './auth.js';
 import { Failure } from './errors.js';
+import { quotaRanges } from './product-store.js';
 
 export function adminConfiguration(env) {
   const email = env.ADMIN_EMAIL || '';
@@ -22,7 +23,7 @@ export function publicUser(user) {
 
 export async function userPatch(body) {
   const keys = Object.keys(body);
-  if (!keys.length || keys.some(key => !['email', 'password', 'disabled'].includes(key))) throw new Failure(400, '仅支持修改 email、password、disabled');
+  if (!keys.length || keys.some(key => !['email', 'password', 'disabled','reason'].includes(key))||keys.every(key=>key==='reason')) throw new Failure(400, '仅支持修改 email、password、disabled；reason 为可选原因');
   const patch = {};
   if (Object.hasOwn(body, 'email')) patch.email = emailAddress(body.email);
   if (Object.hasOwn(body, 'password')) patch.password_hash = await hashPassword(body.password);
@@ -30,21 +31,23 @@ export async function userPatch(body) {
     if (typeof body.disabled !== 'boolean') throw new Failure(400, 'disabled 必须为布尔值');
     patch.disabled = body.disabled;
   }
+  if(Object.hasOwn(body,'reason')){if(typeof body.reason!=='string'||body.reason.length>256)throw new Failure(400,'reason 格式错误');patch.reason=body.reason;}
   return patch;
 }
 
 const uuid = value => /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 export function adminOperation(method, path) {
-  const target = path.match(/^\/admin\/users\/([^/]+)(?:\/disabled)?$/)?.[1];
+  const target = path.match(/^\/admin\/users\/([^/]+)(?:\/(?:disabled|limits))?$/)?.[1];
   const target_id = target && uuid(target) ? target : null;
   let action = 'admin.unknown';
   if (path === '/admin/login' && method === 'POST') action = 'admin.login';
   if (path === '/admin/users' && method === 'GET') action = 'users.list';
   if (path === '/admin/audit-logs' && method === 'GET') action = 'audit.list';
   if (path === '/admin/credentials/rewrap' && method === 'POST') action = 'credentials.rewrap';
-  if (target_id && method === 'GET' && !path.endsWith('/disabled')) action = 'users.get';
-  if (target_id && method === 'PATCH' && !path.endsWith('/disabled')) action = 'users.update';
+  if (target_id && method === 'GET' && path===`/admin/users/${target_id}`) action = 'users.get';
+  if (target_id && method === 'PATCH' && path===`/admin/users/${target_id}`) action = 'users.update';
   if (target_id && method === 'PUT' && path.endsWith('/disabled')) action = 'users.disabled';
+  if (target_id && method === 'PUT' && path.endsWith('/limits')) action = 'users.limits';
   return { action, target_id };
 }
 
@@ -55,15 +58,17 @@ export async function adminRoute({ store, method, path, url, body, context }) {
   if (context.action === 'users.list') {
     const after = url.searchParams.get('after') || '';
     if (after && !uuid(after)) throw new Failure(400, 'after 无效');
-    const users = (await store.adminUsers(after, limit)).map(publicUser);
+    const search=url.searchParams.get('q')||'';if(search.length>128)throw new Failure(400,'q 过长');
+    const users = (await store.adminUsers(after, limit,search)).map(publicUser);
     return { users, next_cursor: users.length === limit ? users.at(-1).id : null };
   }
   if (context.action === 'users.get') {
     const user = publicUser(await store.userById(context.target_id));
-    return { ...user, accounts: await store.accountsForUser(user.id) };
+    return { ...user, accounts: await store.accountsForUser(user.id),projects:store.projects?await store.projects(user.id):[],operations:store.operationStatus?await store.operationStatus(user.id):null,limits:store.userLimits?await store.userLimits(user.id):null };
   }
+  if(context.action==='users.limits'){for(const [name,value] of Object.entries(body)){const range=quotaRanges[name];if(!range||!Number.isInteger(value)||value<range[1]||value>range[2])throw new Failure(400,'用户配额参数无效');}const result=await store.adminSetLimits(context.target_id,body,context);context.recorded=true;return result;}
   if (['users.update', 'users.disabled'].includes(context.action)) {
-    if (context.action === 'users.disabled' && (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'disabled'))) throw new Failure(400, '需要 disabled 布尔值');
+    if (context.action === 'users.disabled' && (Object.keys(body).some(key=>!['disabled','reason'].includes(key)) || !Object.hasOwn(body, 'disabled'))) throw new Failure(400, '需要 disabled 布尔值，可附 reason');
     const patch = await userPatch(body);
     const user = await store.adminUpdateUser(context.target_id, patch, context);
     context.recorded = true;

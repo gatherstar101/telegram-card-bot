@@ -26,7 +26,7 @@ export async function createAuthRuntime(store, env = process.env) {
     sendCode: async (email, code, purpose) => {
       if (!transport) throw new Error('SMTP is not configured');
       await transport.sendMail({ from: env.SMTP_FROM, to: email,
-        subject: purpose === 'register' ? 'Telegram Bot 平台注册验证码' : 'Telegram Bot 平台登录验证码',
+        subject: purpose === 'register' ? 'Telegram Bot 平台注册验证码' : purpose==='reset'?'Telegram Bot 平台密码重置验证码':'Telegram Bot 平台登录验证码',
         text: `您的验证码为 ${code}，有效期 ${Math.ceil(Number(env.AUTH_CHALLENGE_TTL_SECONDS || 600) / 60)} 分钟，仅可使用一次。如非本人操作，请忽略此邮件。`,
       });
     },

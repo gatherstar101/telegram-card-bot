@@ -2,6 +2,9 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import bigInt from 'big-integer';
 import { Api } from 'teleproto';
 import { Failure } from './errors.js';
+import { workflowContext } from './execution-context.js';
+import { jobContext } from './jobs.js';
+import { trackedLink } from './tracking.js';
 
 function text(value, field, maximum) {
   if (typeof value !== 'string' || !value.trim() || value.length > maximum) throw new Failure(400, `${field} 必须为 1–${maximum} 字符`);
@@ -56,7 +59,8 @@ function publicLanding(config) {
 }
 function publicChannel(channel) {
   const { access_hash, posts, ...result } = channel;
-  return { ...result, bot_url: `https://t.me/${channel.bot_username}?start=channel` };
+  const source=/^[a-f0-9-]{36}-(test|production)$/.test(channel.request_key||'')?channel.request_key:'channel';
+  return { ...result, bot_url: `https://t.me/${channel.bot_username}?start=${source}` };
 }
 export function createConversion({ store, connected, save, env = process.env, fetcher = fetch, checkpoint = async () => {} }) {
   return {
@@ -67,19 +71,25 @@ export function createConversion({ store, connected, save, env = process.env, fe
       if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) throw new Failure(403, 'Webhook 密钥错误');
       const message = update?.message;
       if (message?.chat?.type !== 'private' || !/^\/start(?:@\w+)?(?:\s|$)/i.test(message.text || '')) return { ok: true };
-      await botApi(config.token, config.card_image ? 'sendPhoto' : 'sendMessage', {
+      const epoch=store.assertBusiness?await store.assertBusiness(config.user_id):undefined;
+      const policy=store.botPolicy?await store.botPolicy(botId):null;
+      if(policy&&(policy.status!=='active'||policy.environment==='production'&&!policy.published_version||policy.environment==='test'&&!policy.config.test_user_ids.includes(String(message.from?.id))))return {ok:true,ignored:true};
+      const action=()=>botApi(config.token, config.card_image ? 'sendPhoto' : 'sendMessage', {
         chat_id: message.chat.id,
         ...(config.card_image ? { photo: config.card_image, caption: config.card_text } : { text: config.card_text }),
         reply_markup: { inline_keyboard: [[{ text: config.button_text, url: config.landing_url }]] },
       }, fetcher);
+      if(store.dispatch)await store.dispatch(config.user_id,epoch,'card_send',action,policy?.id,policy?.epoch);else await action();
       return { ok: true };
     },
-    async route(method, suffix, id, state, body) {
+    async route(method, suffix, id, state, body,epoch) {
       const botRoute = suffix.match(/^bots\/([A-Za-z0-9_]+)\/(landing|webhook)$/);
       if (botRoute) {
         const [, username, action] = botRoute;
         const bot = await store.get(id, username);
         if (!bot) throw new Failure(404, 'Bot 不属于该账号或尚未创建');
+        const policy=store.botPolicy?await store.botPolicy(bot.token.split(':')[0]):null;
+        if(policy&&method!=='GET'&&workflowContext.getStore()?.project_id!==policy.id)throw new Failure(409,'请通过项目草稿与发布流程修改此资源','PROJECT_MANAGED','edit_project');
         if (action === 'landing' && method === 'PUT') {
           const config = landingConfig(body);
           await store.configureLanding(id, bot.username, config);
@@ -98,8 +108,10 @@ export function createConversion({ store, connected, save, env = process.env, fe
             base = new URL(env.PUBLIC_BASE_URL);
             if (base.protocol !== 'https:' || base.pathname !== '/' || base.search || base.hash || base.username || base.password) throw new Error();
           } catch { throw new Failure(400, 'PUBLIC_BASE_URL 必须为公网 HTTPS 源地址，不含路径'); }
-          const webhookUrl = `${base.origin}/webhooks/${bot.token.split(':')[0]}`;
-          await botApi(bot.token, 'setWebhook', { url: webhookUrl, secret_token: config.webhook_secret, allowed_updates: ['message'] }, fetcher);
+      const webhookUrl = `${base.origin}/webhooks/${bot.token.split(':')[0]}`;
+          const action=()=>botApi(bot.token, 'setWebhook', { url: webhookUrl, secret_token: config.webhook_secret, allowed_updates: ['message'] }, fetcher);
+          const workflow=workflowContext.getStore();
+          if(store.dispatch)await store.dispatch(state.user_id,workflow?.business_epoch??epoch,'webhook_register',action,workflow?.project_id,workflow?.project_epoch);else await action();
           await store.webhookRegistered(id, username, webhookUrl);
           return { username: bot.username, webhook_url: webhookUrl, status: 'registered' };
         }
@@ -178,13 +190,16 @@ export function createConversion({ store, connected, save, env = process.env, fe
         if (!config || config.customer_id !== channel.customer_id) throw new Failure(409, 'Channel 与 Bot 客户配置不一致');
         const request_key = requestKey(body.request_key);
         const message_text = text(body.text, 'text', 3000);
-        const bot_url = `https://t.me/${channel.bot_username}?start=channel`;
-        if (`${message_text}\n\n打开助手：${bot_url}\n查看活动：${config.landing_url}`.length > 4096) throw new Failure(400, '帖子与链接合计不能超过 4096 字符');
+        const bot_url = publicChannel(channel).bot_url;
+        const job=jobContext.getStore();const task=job&&store.assertTask?await store.assertTask(job.id,state.user_id):null;
+        let landing_url=config.landing_url;
+        if(task){const resource=await store.resource(task.project_id,task.environment,'bot');landing_url=trackedLink(env,resource.bot_id,{project_id:task.project_id,environment:task.environment,version:task.config_version,business_epoch:task.business_epoch,project_epoch:task.project_epoch,source:key,persistent:true},landing_url);}
+        if (`${message_text}\n\n打开助手：${bot_url}\n查看活动：${landing_url}`.length > 4096) throw new Failure(400, '帖子与链接合计不能超过 4096 字符');
         let post = await store.getPost(id, key, request_key);
         if (post && (post.message_text !== message_text || post.landing_url !== config.landing_url)) throw new Failure(409, 'request_key 已用于其他帖子内容');
         if (post?.status === 'sent') return post;
         if (!post) {
-          post = { request_key, message_text, bot_url, landing_url: config.landing_url, random_id: (BigInt('0x' + randomBytes(8).toString('hex')) & 0x7fffffffffffffffn).toString() };
+          post = { request_key, message_text, bot_url, landing_url: config.landing_url, delivery_landing_url:landing_url, random_id: (BigInt('0x' + randomBytes(8).toString('hex')) & 0x7fffffffffffffffn).toString() };
           await store.reservePost(id, key, post);
         }
         await connected(state, async client => {
@@ -192,7 +207,7 @@ export function createConversion({ store, connected, save, env = process.env, fe
           const peer = new Api.InputPeerChannel({ channelId: bigInt(channel.channel_id), accessHash: bigInt(channel.access_hash) });
           await checkpoint('post_send',{request_key});
           const result = await client.invoke(new Api.messages.SendMessage({
-            peer, message: `${post.message_text}\n\n打开助手：${post.bot_url}\n查看活动：${post.landing_url}`, randomId: bigInt(post.random_id), noWebpage: true,
+            peer, message: `${post.message_text}\n\n打开助手：${post.bot_url}\n查看活动：${post.delivery_landing_url||post.landing_url}`, randomId: bigInt(post.random_id), noWebpage: true,
           }));
           const messageId = result.id ?? result.updates?.find(item => item.message?.id)?.message?.id ?? null;
           await store.postReady(id, key, request_key, messageId);

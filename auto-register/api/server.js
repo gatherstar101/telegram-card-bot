@@ -11,6 +11,7 @@ import { Deliveries } from './deliveries.js';
 import { background } from './queue-store.js';
 import { integer,audit,validateConfig } from './security.js';
 import { bootstrapAdmin } from './admin.js';
+import { Products } from './products.js';
 
 process.umask(0o077);
 const env=process.env;
@@ -28,12 +29,14 @@ let jobs;
 const service=createService({store,auth,connected,env,checkpoint:effect=>jobs.checkpoint(effect)});
 jobs=new Jobs(store,auth,env,(...args)=>service.route(...args));
 const deliveries=new Deliveries(store,auth,env);
-const server=http.createServer(createApplication({store,auth,service,jobs,deliveries,env}));
+const products=new Products(store,auth,jobs,service,env);
+const server=http.createServer(createApplication({store,auth,service,jobs,deliveries,products,env}));
 server.requestTimeout=15000;server.headersTimeout=10000;server.keepAliveTimeout=5000;
 const interval=integer(env,'QUEUE_POLL_INTERVAL_MS',1000,100,10000);
 const stopJobs=background(()=>jobs.runOnce(),{interval,onError:()=>audit('job_worker_error',{kind:'storage_or_runtime'})});
 const stopDeliveries=background(()=>deliveries.runOnce(),{interval,onError:()=>audit('webhook_worker_error',{kind:'storage_or_runtime'})});
+const stopProducts=background(()=>products.runOnce(),{interval,onError:()=>audit('workflow_worker_error',{kind:'storage_or_runtime'})});
 server.listen(integer(env,'PORT',3100,1,65535),'0.0.0.0',()=>audit('service_started'));
 let stopping=false;
-async function stop(){if(stopping)return;stopping=true;audit('service_stopping');try{await Promise.all([new Promise(resolve=>server.close(resolve)),stopJobs(),stopDeliveries()]);await auth.close();await store.close();audit('service_stopped');}catch{audit('service_shutdown_error');process.exitCode=1;}}
+async function stop(){if(stopping)return;stopping=true;audit('service_stopping');try{await Promise.all([new Promise(resolve=>server.close(resolve)),stopJobs(),stopDeliveries(),stopProducts()]);await auth.close();await store.close();audit('service_stopped');}catch{audit('service_shutdown_error');process.exitCode=1;}}
 process.on('SIGTERM',stop);process.on('SIGINT',stop);

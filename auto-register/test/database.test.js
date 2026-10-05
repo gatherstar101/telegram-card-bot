@@ -6,6 +6,7 @@ import {databaseConfig,postgresParameters} from '../api/database.js';
 import {createStore} from '../api/store.js';
 import {postgresTables} from '../api/postgres-schema.js';
 import {tables} from '../api/schema.js';
+import {productTables} from '../api/product-schema.js';
 
 const base={DB_HOST:'localhost',DB_DATABASE:'telegram_test',DB_USER:'test',DB_PASSWORD:'test'};
 test('DB configuration validates engines, names, ports, privileges and TLS',()=>{
@@ -29,7 +30,7 @@ test('PostgreSQL bind translation preserves SQL literals, identifiers and commen
   assert.deepEqual(postgresParameters(escapes),{text:escapes.slice(0,-1).replace(', ?,',', $1,')+'$2',count:2});
 });
 test('manual SQL stays aligned with both runtime schemas',async()=>{
-  for(const [file,ddl] of [['init.sql',tables],['postgresql/init.sql',postgresTables]]){
+  for(const [file,ddl] of [['init.sql',[...tables,...productTables('mysql').map(entry=>typeof entry==='string'?entry:entry.sql)]],['postgresql/init.sql',[...postgresTables,...productTables('postgresql')]]]){
     const sql=await readFile(new URL('../sql/'+file,import.meta.url),'utf8');
     for(const statement of ddl)assert.ok(sql.includes(statement+';'),file);
   }

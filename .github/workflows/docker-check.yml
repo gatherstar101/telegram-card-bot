@@ -64,7 +64,7 @@ jobs:
       - run: npm test
         working-directory: auto-register
       - name: SQL and Redis security and upgrade tests
-        run: node --test --test-concurrency=1 test/database.test.js test/admin.test.js test/security.test.js test/upgrade.test.js
+        run: node --test --test-concurrency=1 test/database.test.js test/admin.test.js test/security.test.js test/products.test.js test/upgrade.test.js
         working-directory: auto-register
         env:
           SECURITY_INTEGRATION: '1'
